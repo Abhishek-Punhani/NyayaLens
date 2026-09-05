@@ -1,0 +1,33 @@
+# NyayaLens Backend Dependencies
+# Pinned to verified installed versions — generated 2026-09-06
+# To install: pip install -r requirements.txt
+
+# ── API Server ──────────────────────────────────────────────────────────────
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+python-multipart==0.0.32
+
+# ── LangGraph Agents + SQLite Checkpointing ─────────────────────────────────
+langgraph==1.1.10
+langgraph-checkpoint-sqlite==3.1.1
+langchain-google-genai==4.4.0
+
+# ── Google GenAI (Gemini Live, Embeddings) ──────────────────────────────────
+google-genai==2.22.0
+
+# ── Vector Store (ChromaDB) ─────────────────────────────────────────────────
+chromadb==1.5.9
+
+# ── Environment & Config ───────────────────────────────────────────────────
+python-dotenv==1.0.1
+
+# ── HTTP & Async IO ────────────────────────────────────────────────────────
+httpx==0.28.1
+aiofiles==25.1.0
+websockets==16.0
+
+# ── OCR / Document Processing ──────────────────────────────────────────────
+pillow==12.2.0
+
+# ── Data Validation ────────────────────────────────────────────────────────
+pydantic>=2.7.0
