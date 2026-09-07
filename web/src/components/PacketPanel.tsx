@@ -1,21 +1,24 @@
 "use client";
 
 import React, { useState } from "react";
-import { Download, Copy, Check, MessageSquare, FileCheck2 } from "lucide-react";
+import { Download, Copy, Check, MessageSquare, FileCheck2, RefreshCw } from "lucide-react";
 
 interface PacketPanelProps {
   markdown: string | null;
   whatsappSummary: string | null;
   sessionId: string | null;
+  backendUrl?: string;
+  onRefresh?: () => void;
 }
 
 export const PacketPanel: React.FC<PacketPanelProps> = ({
   markdown,
   whatsappSummary,
   sessionId,
+  onRefresh,
 }) => {
   const [copiedWA, setCopiedWA] = useState(false);
-  const [copiedMD, setCopiedMD] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
 
   const handleCopyWA = async () => {
     if (!whatsappSummary) return;
@@ -35,6 +38,16 @@ export const PacketPanel: React.FC<PacketPanelProps> = ({
     URL.revokeObjectURL(url);
   };
 
+  const handleRefresh = async () => {
+    if (!onRefresh) return;
+    setRefreshing(true);
+    try {
+      await onRefresh();
+    } finally {
+      setRefreshing(false);
+    }
+  };
+
   return (
     <div className="h-full flex flex-col overflow-hidden bg-background">
       {/* Header Bar */}
@@ -45,6 +58,17 @@ export const PacketPanel: React.FC<PacketPanelProps> = ({
         </div>
 
         <div className="flex items-center gap-2">
+          {onRefresh && (
+            <button
+              onClick={handleRefresh}
+              disabled={refreshing}
+              className="flex items-center gap-1.5 px-2.5 py-1.5 bg-surface hover:bg-surface-hover border border-border rounded-lg text-xs text-muted transition-colors disabled:opacity-50"
+            >
+              <RefreshCw className={`w-3.5 h-3.5 ${refreshing ? "animate-spin" : ""}`} />
+              Refresh State
+            </button>
+          )}
+
           {whatsappSummary && (
             <button
               onClick={handleCopyWA}
@@ -76,6 +100,16 @@ export const PacketPanel: React.FC<PacketPanelProps> = ({
             <p className="text-[11px] text-gray-500">
               Complete the intake and consent flow to generate the formal case brief.
             </p>
+            {onRefresh && (
+              <button
+                onClick={handleRefresh}
+                disabled={refreshing}
+                className="mt-2 flex items-center gap-1.5 px-3 py-1.5 bg-surface hover:bg-surface-hover border border-border rounded-lg text-xs text-muted transition-colors disabled:opacity-50"
+              >
+                <RefreshCw className={`w-3.5 h-3.5 ${refreshing ? "animate-spin" : ""}`} />
+                Refresh State
+              </button>
+            )}
           </div>
         ) : (
           <div className="bg-surface border border-border rounded-xl p-5 shadow-sm space-y-4">
@@ -83,7 +117,7 @@ export const PacketPanel: React.FC<PacketPanelProps> = ({
             {whatsappSummary && (
               <div className="bg-[#1a221a] border border-emerald-900/60 rounded-xl p-4 text-xs text-emerald-200 leading-relaxed font-sans space-y-1">
                 <span className="font-semibold uppercase tracking-wider text-[10px] text-emerald-400 block mb-1">
-                  WhatsApp Executive Summary (≤500 words Hinglish)
+                  WhatsApp Executive Summary (&le;500 words Hinglish)
                 </span>
                 <p className="whitespace-pre-wrap">{whatsappSummary}</p>
               </div>

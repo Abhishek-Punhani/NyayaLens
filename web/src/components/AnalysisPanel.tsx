@@ -1,7 +1,7 @@
 "use client";
 
-import React from "react";
-import { BarChart3, BookOpen, AlertCircle } from "lucide-react";
+import React, { useState } from "react";
+import { BarChart3, BookOpen, AlertCircle, RefreshCw } from "lucide-react";
 
 export interface ReadinessSignals {
   evidence_completeness: number;
@@ -28,20 +28,51 @@ export interface CitationItem {
 interface AnalysisPanelProps {
   readiness: ReadinessSignals | null;
   citations: CitationItem[];
+  sessionId?: string | null;
+  backendUrl?: string;
+  onRefresh?: () => void;
 }
 
-export const AnalysisPanel: React.FC<AnalysisPanelProps> = ({ readiness, citations }) => {
+export const AnalysisPanel: React.FC<AnalysisPanelProps> = ({
+  readiness,
+  citations,
+  onRefresh,
+}) => {
+  const [refreshing, setRefreshing] = useState(false);
+
+  const handleRefresh = async () => {
+    if (!onRefresh) return;
+    setRefreshing(true);
+    try {
+      await onRefresh();
+    } finally {
+      setRefreshing(false);
+    }
+  };
+
   return (
     <div className="h-full overflow-y-auto p-4 space-y-5">
       {/* Header */}
       <div className="flex items-center justify-between pb-2 border-b border-border">
         <div>
-          <h3 className="text-sm font-semibold text-gray-100">Adversarial & Readiness Audit</h3>
+          <h3 className="text-sm font-semibold text-gray-100">Adversarial &amp; Readiness Audit</h3>
           <p className="text-xs text-muted">Factor-level readiness metrics (zero win-probability heuristic)</p>
         </div>
-        <span className="text-xs font-mono bg-surface px-2.5 py-1 rounded border border-border text-muted">
-          {citations.length} precedents cited
-        </span>
+        <div className="flex items-center gap-2">
+          <span className="text-xs font-mono bg-surface px-2.5 py-1 rounded border border-border text-muted">
+            {citations.length} precedents cited
+          </span>
+          {onRefresh && (
+            <button
+              onClick={handleRefresh}
+              disabled={refreshing}
+              className="flex items-center gap-1.5 px-2.5 py-1 bg-surface hover:bg-surface-hover border border-border rounded-lg text-[11px] text-muted transition-colors disabled:opacity-50"
+            >
+              <RefreshCw className={`w-3 h-3 ${refreshing ? "animate-spin" : ""}`} />
+              Refresh State
+            </button>
+          )}
+        </div>
       </div>
 
       {!readiness ? (
@@ -51,6 +82,16 @@ export const AnalysisPanel: React.FC<AnalysisPanelProps> = ({ readiness, citatio
           <p className="text-[11px] text-gray-500">
             Once intake completes and confirmation triggers, parallel adversarial agents compile this audit.
           </p>
+          {onRefresh && (
+            <button
+              onClick={handleRefresh}
+              disabled={refreshing}
+              className="mt-2 flex items-center gap-1.5 px-3 py-1.5 bg-surface hover:bg-surface-hover border border-border rounded-lg text-xs text-muted transition-colors disabled:opacity-50"
+            >
+              <RefreshCw className={`w-3 h-3 ${refreshing ? "animate-spin" : ""}`} />
+              Refresh State
+            </button>
+          )}
         </div>
       ) : (
         <div className="space-y-4">

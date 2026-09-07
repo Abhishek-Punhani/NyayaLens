@@ -12,6 +12,7 @@ import { FlagsPanel } from "@/components/FlagsPanel";
 import { AnalysisPanel } from "@/components/AnalysisPanel";
 import { PacketPanel } from "@/components/PacketPanel";
 import { AgentThinking } from "@/components/AgentThinking";
+import { DocumentUploadPanel } from "@/components/DocumentUploadPanel";
 import { useNyayaSession } from "@/hooks/useNyayaSession";
 import { useToolHandler } from "@/hooks/useToolHandler";
 import { useLiveAPI } from "@/lib/use-live-api";
@@ -29,11 +30,21 @@ export default function NyayaApp() {
   const liveAPI = useLiveAPI({});
   const { client, connected, connect, disconnect, volume, speakingText } = liveAPI;
 
-  // Tool dispatcher
+  // Auto-disconnect handler — triggered by AI calling end_session tool
+  const handleSessionEnd = (reason: string) => {
+    session.addThinkingLog(`[Auto-Disconnect] Session ended: ${reason}`);
+    disconnect();
+    session.closeSession();
+  };
+
+  // Tool dispatcher — pass addPendingDoc so flag_document_upload wires uploads
+  // and onSessionEnd so end_session auto-disconnects the live audio
   const { dispatchToolCall } = useToolHandler(
     session.sessionId,
     backendUrl,
-    session.addThinkingLog
+    session.addThinkingLog,
+    session.addPendingDoc,
+    handleSessionEnd
   );
 
   // Wire tool call handler into live client
@@ -42,8 +53,12 @@ export default function NyayaApp() {
 
     const onToolCall = async (toolCall: any) => {
       session.setIsThinking(true);
-      const res = await dispatchToolCall(toolCall);
-      client.sendToolResponse(res);
+      try {
+        const res = await dispatchToolCall(toolCall);
+        client.sendToolResponse(res);
+      } finally {
+        session.setIsThinking(false);
+      }
     };
 
     client.on("toolcall", onToolCall);
@@ -77,6 +92,26 @@ export default function NyayaApp() {
     });
   }, [speakingText]);
 
+  // Refresh state from backend — fetches latest from analysis_graph checkpoint
+  const handleRefreshState = async () => {
+    if (!session.sessionId) return;
+    try {
+      const res = await fetch(`${backendUrl}/api/session/${session.sessionId}`);
+      const data = await res.json();
+      if (data.state) {
+        if (data.state.facts?.length) session.setFacts(data.state.facts);
+        if (data.state.fuzziness_flags?.length) session.setFlags(data.state.fuzziness_flags);
+        if (data.state.precedents?.length) session.setCitations(data.state.precedents);
+        if (data.state.readiness_signals) session.setReadiness(data.state.readiness_signals);
+        if (data.state.lawyer_packet_markdown) session.setPacketMarkdown(data.state.lawyer_packet_markdown);
+        if (data.state.lawyer_packet_json?.whatsapp_summary)
+          session.setWhatsappSummary(data.state.lawyer_packet_json.whatsapp_summary);
+      }
+    } catch {
+      // swallow
+    }
+  };
+
   // Handle Session Start
   const handleStart = async (params: {
     apiKey: string;
@@ -98,7 +133,7 @@ export default function NyayaApp() {
         responseModalities: ["AUDIO"],
         speechConfig: {
           voiceConfig: {
-            prebuiltVoiceConfig: { voiceName: "Kore" },
+            prebuiltVoiceConfig: { voiceName: "Aoede" },
           },
         },
         systemInstruction: { parts: [{ text: NYAYA_SYSTEM_PROMPT }] },
@@ -121,7 +156,7 @@ export default function NyayaApp() {
         {
           id: "sys-init",
           sender: "system",
-          text: `Intake session initialized for ${params.lawyerName}. Specific Relief Act §6 track active.`,
+          text: `Intake session initialized for ${params.lawyerName}. Motor Accident intake active — MV Act §166 claim track.`,
           timestamp: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
         },
       ]);
@@ -151,7 +186,7 @@ export default function NyayaApp() {
                 v3.0 Indian Law
               </span>
             </h1>
-            <p className="text-[11px] text-muted">Voice Legal Intake · Property Dispute Vertical</p>
+            <p className="text-[11px] text-muted">Voice Legal Intake · Motor Accident Vertical</p>
           </div>
         </div>
 
@@ -169,7 +204,7 @@ export default function NyayaApp() {
 
           <div className="flex items-center gap-1.5 text-xs text-muted font-medium bg-[#141414] px-2.5 py-1 rounded-md border border-border">
             <ShieldCheck className="w-3.5 h-3.5 text-accent" />
-            <span>DPDP & Section 6 SRA Compliant</span>
+            <span>DPDP &amp; MV Act Compliant</span>
           </div>
         </div>
       </header>
@@ -191,11 +226,14 @@ export default function NyayaApp() {
             <VoiceOrb
               connected={connected}
               speaking={speakingText.length > 0}
+              isThinking={session.isThinking}
               volume={volume}
               onClick={connected ? handleStop : () => {}}
               statusLabel={
                 connected
-                  ? speakingText.length > 0
+                  ? session.isThinking
+                    ? "Agent is thinking..."
+                    : speakingText.length > 0
                     ? "Nyaya is addressing client..."
                     : "Listening for Hindi / Hinglish narrative..."
                   : "Start session to initialize voice agent"
@@ -205,9 +243,19 @@ export default function NyayaApp() {
           </div>
 
           {/* Transcript Feed */}
-          <div className="flex-1 overflow-hidden flex flex-col">
+          <div className="flex-1 overflow-hidden flex flex-col min-h-0">
             <Transcript turns={turns} />
           </div>
+
+          {/* Document Upload Panel — shown only when there are pending docs */}
+          {session.sessionId && session.pendingDocs.length > 0 && (
+            <DocumentUploadPanel
+              pendingDocs={session.pendingDocs}
+              sessionId={session.sessionId}
+              backendUrl={backendUrl}
+              onDocUploaded={session.markDocUploaded}
+            />
+          )}
         </div>
 
         {/* Right Column: Claude-style Observability Panels & SSE Thinking (Flex 1) */}
@@ -228,13 +276,21 @@ export default function NyayaApp() {
               {activeTab === "evidence" && <EvidenceBoard facts={session.facts} />}
               {activeTab === "flags" && <FlagsPanel flags={session.flags} />}
               {activeTab === "analysis" && (
-                <AnalysisPanel readiness={session.readiness} citations={session.citations} />
+                <AnalysisPanel
+                  readiness={session.readiness}
+                  citations={session.citations}
+                  sessionId={session.sessionId}
+                  backendUrl={backendUrl}
+                  onRefresh={handleRefreshState}
+                />
               )}
               {activeTab === "packet" && (
                 <PacketPanel
                   markdown={session.packetMarkdown}
                   whatsappSummary={session.whatsappSummary}
                   sessionId={session.sessionId}
+                  backendUrl={backendUrl}
+                  onRefresh={handleRefreshState}
                 />
               )}
             </div>
