@@ -57,7 +57,8 @@ class FuzzinessFlag(BaseModel):
     flag_type: Literal[
         "contradiction", "timeline_conflict", "vague_account",
         "missing_document", "liability_ambiguity",
-        "jurisdiction_ambiguity", "witness_or_evidence_gap"
+        "jurisdiction_ambiguity", "witness_or_evidence_gap",
+        "quantum_data_gap", "limitation_risk", "defense_vulnerability"
     ]
     severity: Literal["low", "medium", "high"]
     fact_refs: list[str]
@@ -108,10 +109,17 @@ class CaseState(TypedDict):
     lawyer_contact: Optional[str]
     precedents: Annotated[list[CitationRecord], operator.add]
     opposition_case: Optional[dict]
+    opposition_analysis_dict: Optional[dict]
     witness_candidates: Annotated[list[WitnessCandidate], operator.add]
     arguments: Annotated[list[ArgumentHypothesis], operator.add]
     readiness_signals: Optional[ReadinessSignals]
     lawyer_packet_markdown: Optional[str]
     lawyer_packet_json: Optional[dict]
-    accident_subtype: Optional[str]   # ← add this line
-
+    accident_subtype: Optional[str]
+    # PEACE model interview stage — controls cross_question_node behavior
+    interview_stage: Optional[Literal[
+        "engage", "narrative", "timeline_liability",
+        "regulatory", "quantum_profiling", "defense_audit", "closure"
+    ]]
+    # Victim/client profile for Sarla Verma / Pranay Sethi MACT compensation calculation
+    client_profile: Optional[dict]

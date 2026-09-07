@@ -18,7 +18,7 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from langgraph.types import interrupt
 
 from app.config import GOOGLE_API_KEY, MODEL_FLASH
-from app.legal_data.Motor_accident_schema import get_missing_fields, get_next_priority_field
+from app.legal_data.Motor_accident_schema import get_missing_fields, get_missing_fields_by_phase, get_next_priority_field
 from app.legal_data.section_mapping import get_applicable_law
 from app.prompts.global_policy import inject_policy
 from app.prompts.analysis_prompts import CONFIRMATION_FLOW_PROMPTS
@@ -140,14 +140,39 @@ async def case_type_router_node(state: CaseState) -> dict:
         }
 
 # ---------------------------------------------------------------------------
-# Node 2 — Cross-Questioning Agent
+# Node 2 — Cross-Questioning Agent (PEACE Model + Cognitive Interview)
 # ---------------------------------------------------------------------------
+
+# PEACE stage progression — each stage advances to the next once its goals are met.
+# The LLM decides when to advance by returning interview_stage_after in its JSON output.
+_STAGE_ORDER = [
+    "engage",
+    "narrative",
+    "timeline_liability",
+    "regulatory",
+    "quantum_profiling",
+    "defense_audit",
+    "closure",
+]
 
 async def cross_question_node(state: CaseState) -> dict:
     """
-    Conducts the evidence-driven cross-questioning interview for motor
-    accident cases. Uses interrupt() to pause the graph and wait for the
-    client's answer. Each new fact is written with evidence_type=CLIENT_STATED.
+    Conducts the PEACE-model phased interview for motor accident cases.
+    Stages:
+      engage → narrative → timeline_liability → regulatory →
+      quantum_profiling → defense_audit → closure
+
+    Each stage has specific rules:
+    - engage: trauma-informed ground rules only, NO case questions
+    - narrative: ONE open TED prompt, NO interruptions
+    - timeline_liability: funnel (open → specific → closed → confirm)
+    - regulatory: FIR/MLC/FAR/DAR/limitation check
+    - quantum_profiling: victim age, occupation, income, dependents (Sarla Verma inputs)
+    - defense_audit: DL validity, helmet, intoxication, overloading
+    - closure: reflect and confirm
+
+    Facts from prior turns are passed via facts_json so the LLM never re-asks.
+    Client profile is accumulated across stages.
     """
     try:
         llm = _flash_llm()
@@ -155,98 +180,123 @@ async def cross_question_node(state: CaseState) -> dict:
         facts = state.get("facts", [])
         fuzziness_flags = state.get("fuzziness_flags", [])
         subtype = state.get("accident_subtype", "not_applicable")
+        current_stage = state.get("interview_stage") or "engage"
+        client_profile = state.get("client_profile") or {}
 
         missing_fields = get_missing_fields(facts)
-        unresolved_flags = [f for f in fuzziness_flags if not f.resolved and f.blocks_handoff]
+        missing_by_phase = get_missing_fields_by_phase(facts)
+        unresolved_flags = [f for f in fuzziness_flags if not f.resolved]
 
         system_prompt = inject_policy(CROSS_QUESTION_PROMPT.format(
             language=language,
+            interview_stage=current_stage,
             facts_json=_facts_to_json(facts),
             accident_subtype=subtype,
-            missing_fields=json.dumps(missing_fields),
+            missing_fields=json.dumps(missing_by_phase),
             fuzziness_flags=_flags_to_json(unresolved_flags),
+            client_profile_json=json.dumps(client_profile, ensure_ascii=False, indent=2),
         ))
 
-        # Get the last user turn as context
+        # Build the conversation with full context (last 10 turns)
         messages = state.get("messages", [])
-        last_user_msg = ""
-        for msg in reversed(messages):
+        conversation = [("system", system_prompt)]
+        for msg in messages[-10:]:
             if isinstance(msg, HumanMessage):
-                last_user_msg = msg.content
-                break
+                conversation.append(("human", msg.content))
+            elif isinstance(msg, AIMessage):
+                conversation.append(("ai", msg.content))
 
-        response = await llm.ainvoke([
-            ("system", system_prompt),
-            ("human", last_user_msg or "Namaskar, mujhe apni baat batani hai."),
-        ])
+        # Fallback seed if conversation is empty
+        if len(conversation) == 1:
+            conversation.append(("human", "Namaskar, mujhe apni baat batani hai."))
+
+        response = await llm.ainvoke(conversation)
 
         try:
             parsed = _parse_json_block(response.content)
         except json.JSONDecodeError:
-            # Fallback: treat entire response as the spoken_response
             parsed = {
                 "spoken_response": response.content,
                 "next_question": response.content,
                 "reason": "llm_free_text",
+                "interview_stage_after": current_stage,
                 "updated_fact_candidates": [],
+                "client_profile_update": {},
                 "requires_human_review": False,
             }
 
-        next_question = parsed.get("next_question", parsed.get("spoken_response", ""))
-        spoken_response = parsed.get("spoken_response", next_question)
+        spoken_response = parsed.get("spoken_response", "")
+        next_question = parsed.get("next_question", spoken_response)
         candidates = parsed.get("updated_fact_candidates", [])
+        new_stage = parsed.get("interview_stage_after", current_stage)
+        profile_update = parsed.get("client_profile_update") or {}
+
+        # Merge profile update into existing profile (shallow merge, never overwrite with blank)
+        updated_profile = {**client_profile}
+        for k, v in profile_update.items():
+            if v is not None and v != "" and v != [] and v != {}:
+                updated_profile[k] = v
 
         # ── Pause graph — wait for client's spoken answer ────────────────────
         client_answer: str = interrupt(value={
             "spoken_response": spoken_response,
             "next_question": next_question,
+            "interview_stage": current_stage,
         })
 
-        # ── Write new facts with evidence provenance ─────────────────────────
+        # ── Write new facts from LLM candidates ─────────────────────────────
         turn_id = f"turn_{uuid.uuid4().hex[:8]}"
         new_facts: list[Fact] = []
 
         for candidate in candidates:
+            if not candidate.get("field") or not candidate.get("value"):
+                continue
             new_facts.append(Fact(
-                fact_id=f"F-{uuid.uuid4().hex[:8]}",
-                field=candidate.get("field", "unknown"),
-                value=candidate.get("value", ""),
-                evidence_type="CLIENT_STATED",   # provenance set at write-time
+                fact_id=f"F-{uuid.uuid4().hex[:8]}_cq",
+                field=candidate["field"],
+                value=candidate["value"],
+                evidence_type="CLIENT_STATED",
                 source_ref=turn_id,
                 confidence=candidate.get("confidence", 0.7),
                 status="unconfirmed",
                 contradicts=[],
-                epistemic_status=candidate.get("epistemic_status"),   # ← add
+                epistemic_status=candidate.get("epistemic_status", "direct"),
             ))
 
-        # Also write the raw client answer as a fact
-        if client_answer:
+        # Also write raw client answer as a general fact for the entity_tracker to process
+        if client_answer and client_answer.strip():
             next_field = get_next_priority_field(facts + new_facts) or "general_statement"
             new_facts.append(Fact(
-                fact_id=f"F-{uuid.uuid4().hex[:8]}",
+                fact_id=f"F-{uuid.uuid4().hex[:8]}_raw",
                 field=next_field,
                 value=client_answer,
                 evidence_type="CLIENT_STATED",
                 source_ref=turn_id,
-                confidence=0.6,
+                confidence=0.5,
                 status="unconfirmed",
                 contradicts=[],
             ))
 
-        accident_date_fact = next((f for f in new_facts if f.field == "accident_datetime"), None)
+        # Determine applicable law from accident date if now known
         law_ctx_update = {}
+        accident_date_fact = next((f for f in new_facts if f.field == "accident_datetime"), None)
         if accident_date_fact:
             law_ctx_update["law_version_context"] = get_applicable_law(accident_date_fact.value)
 
-
         return {
             "facts": new_facts,
+            "interview_stage": new_stage,
+            "client_profile": updated_profile,
             **law_ctx_update,
             "messages": [
                 AIMessage(content=spoken_response),
                 HumanMessage(content=client_answer),
             ],
         }
+
+    except Exception as exc:
+        logger.error("cross_question_node error: %s", exc, exc_info=True)
+        return {}
 
     except Exception as exc:
         logger.error("cross_question_node error: %s", exc, exc_info=True)
@@ -321,13 +371,15 @@ async def fuzziness_detector_node(state: CaseState) -> dict:
 
 async def entity_tracker_node(state: CaseState) -> dict:
     """
-    Extracts people, properties, events, relationships, and timeline entries
-    from the conversation. Updates the entity graph and timeline.
+    Extracts people, vehicles, events, relationships, timeline entries, and
+    victim profile data from the conversation. Updates the entity graph,
+    timeline, and client_profile (for MACT quantum calculation).
     """
     try:
         llm = _flash_llm()
         messages = state.get("messages", [])
         facts = state.get("facts", [])
+        client_profile = state.get("client_profile") or {}
 
         # Build transcript string from messages
         transcript_lines = []
@@ -341,11 +393,12 @@ async def entity_tracker_node(state: CaseState) -> dict:
         system_prompt = inject_policy(FACT_EXTRACTION_PROMPT.format(
             transcript=transcript,
             existing_facts=_facts_to_json(facts),
+            existing_client_profile=json.dumps(client_profile, ensure_ascii=False),
         ))
 
         response = await llm.ainvoke([
             ("system", system_prompt),
-            ("human", "Extract entities and timeline. Return JSON with keys: entity_graph, timeline, new_facts."),
+            ("human", "Extract entities, timeline, new_facts, and client_profile_update. Return JSON."),
         ])
 
         try:
@@ -365,7 +418,7 @@ async def entity_tracker_node(state: CaseState) -> dict:
                 if evidence_type not in ("CLIENT_STATED", "DOCUMENT_EXTRACTED", "LEGAL_SOURCE", "INFERENCE", "UNKNOWN"):
                     evidence_type = "UNKNOWN"
                 new_facts.append(Fact(
-                    fact_id=rf.get("fact_id", f"F-{uuid.uuid4().hex[:8]}"),
+                    fact_id=rf.get("fact_id", f"F-{uuid.uuid4().hex[:8]}_et"),
                     field=rf.get("field", "unknown"),
                     value=rf.get("value", ""),
                     evidence_type=evidence_type,
@@ -378,11 +431,22 @@ async def entity_tracker_node(state: CaseState) -> dict:
             except Exception:
                 pass
 
-        return {
+        # Merge any client profile data extracted from the conversation
+        profile_update = parsed.get("client_profile_update") or {}
+        updated_profile = {**client_profile}
+        for k, v in profile_update.items():
+            if v is not None and v != "" and v != [] and v != {}:
+                updated_profile[k] = v
+
+        result: dict = {
             "entity_graph": entity_graph,
             "timeline": timeline,
             "facts": new_facts,
         }
+        if updated_profile != client_profile:
+            result["client_profile"] = updated_profile
+
+        return result
 
     except Exception as exc:
         logger.error("entity_tracker_node error: %s", exc, exc_info=True)

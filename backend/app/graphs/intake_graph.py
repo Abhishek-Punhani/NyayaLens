@@ -17,27 +17,22 @@ from app.legal_data.Motor_accident_schema import get_missing_fields
 def should_continue_intake(state: CaseState) -> str:
     """
     Conditional edge: decide what to do after cross_question node runs.
-    - If there are high-severity fuzziness flags: route to fuzziness_detector
-    - If documents are mentioned but not all uploaded: route to document_request
-    - If all schema fields filled and no blocks_handoff flags: route to confirmation
+    - If documents are requested but not uploaded: route to document_request
+    - If interview_stage is 'closure': route to confirmation
     - Otherwise: loop back to cross_question
     """
-    missing = get_missing_fields(state.get("facts", []))
-    blocking_flags = [
-        f for f in state.get("fuzziness_flags", [])
-        if getattr(f, "blocks_handoff", False) and not getattr(f, "resolved", False)
-    ]
+    stage = state.get("interview_stage", "engage")
     docs_pending = [
         d for d in state.get("documents", [])
         if getattr(d, "upload_status", "") == "requested"
     ]
 
-    if blocking_flags:
-        return "fuzziness_detector"
     if docs_pending:
         return "document_request"
-    if not missing and not blocking_flags:
+    
+    if stage == "closure":
         return "confirmation_flow"
+        
     return "cross_question"
 
 
