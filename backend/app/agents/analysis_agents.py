@@ -20,7 +20,6 @@ from app.prompts.analysis_prompts import (
     LAWYER_CHAT_PROMPT,
     OPPOSITION_PROMPT,
     PACKET_COMPILER_PROMPT,
-    PRECEDENT_RESEARCH_PROMPT,
     READINESS_ANALYSIS_PROMPT,
     WITNESS_CANDIDATE_PROMPT,
 )
@@ -29,8 +28,6 @@ from app.state import (
     ArgumentHypothesis,
     CaseState,
     CitationRecord,
-    Fact,
-    FuzzinessFlag,
     ReadinessSignals,
     WitnessCandidate,
 )
@@ -135,7 +132,7 @@ async def precedent_research_node(state: CaseState) -> dict:
         llm     = _search_llm()
         facts   = state.get("facts", [])
         flags   = state.get("fuzziness_flags", [])
-        track   = state.get("dispossession_track", "not_determined")
+        track   = state.get("accident_subtype", "not_applicable")
         law_ctx = state.get("law_version_context", "unknown")
 
         citations: list[CitationRecord] = []
@@ -146,16 +143,17 @@ async def precedent_research_node(state: CaseState) -> dict:
             "You are an expert Indian Legal Research Analyst.\n"
             "Analyze the case facts below and generate 3-4 targeted search queries "
             "to find RELEVANT Supreme Court and High Court JUDGMENTS on Indian Kanoon.\n"
-            "Focus on: settled possession, dispossession, property dispute outcomes, "
-            "injunction standards, adverse possession, title suits — whatever the facts point to.\n\n"
+            "Focus on: motor accident compensation, negligence, rash/negligent driving, "
+            "MACT tribunal jurisdiction, MV Act compensation quantum, insurance liability — "
+            "whatever the specific facts and accident sub-type point to.\n\n"
             f"Case Facts:\n{_to_json(facts)}\n\n"
-            f"Dispossession Track: {track}\n"
+            f"Accident Sub-type: {track}\n"
             f"Law Version Context: {law_ctx}\n"
             f"Fuzziness Flags:\n{_to_json(flags)}\n\n"
             "Return ONLY a valid JSON array of query strings. Examples:\n"
-            '["settled possession without due process Supreme Court India",\n'
-            ' "forcible dispossession tenant injunction High Court",\n'
-            ' "adverse possession title suit limitation 12 years"]\n'
+            '["motor accident compensation negligence Supreme Court India",\n'
+            ' "MACT tribunal jurisdiction MV Act 166 High Court",\n'
+            ' "rash negligent driving BNS section compensation"]\n'
             "Return ONLY the JSON array, no explanation."
         )
 
@@ -240,19 +238,19 @@ async def statute_analysis_node(state: CaseState) -> dict:
     try:
         llm     = _search_llm()
         facts   = state.get("facts", [])
-        track   = state.get("dispossession_track", "not_determined")
+        track   = state.get("accident_subtype", "not_applicable")
         law_ctx = state.get("law_version_context", "unknown")
         flags   = state.get("fuzziness_flags", [])
 
         # ── Step 1: Build compact section menu from actual JSON DB indexes ──────
         if law_ctx == "pre_2024_codes":
-            local_acts = ["IPC", "IEA", "CRPC", "CPC", "NIA"]
+            local_acts = ["IPC", "IEA", "CRPC", "CPC", "MVA", "NIA"]
             live_acts  = []
         elif law_ctx == "post_2024_codes":
-            local_acts = ["CPC", "NIA"]
+            local_acts = ["CPC", "MVA", "NIA"]
             live_acts  = ["BNS", "BNSS", "BSA"]
         else:  # mixed / unknown — both
-            local_acts = ["IPC", "IEA", "CRPC", "CPC", "NIA"]
+            local_acts = ["IPC", "IEA", "CRPC", "CPC", "MVA", "NIA"]
             live_acts  = ["BNS", "BNSS", "BSA"]
 
         menu_lines = []
@@ -283,18 +281,18 @@ async def statute_analysis_node(state: CaseState) -> dict:
 
         # ── Step 2: LLM picks from menu (old codes) + identifies new code sections ──
         pick_prompt = (
-            "You are an expert Indian property and criminal law analyst.\n"
+            "You are an expert Indian motor accident and criminal law analyst.\n"
             "Based on the case facts, pick EVERY applicable section:\n\n"
-            "For OLD codes (IPC/IEA/CRPC/CPC/NIA): pick ONLY from the numbered menu below.\n"
+            "For OLD codes (IPC/IEA/CRPC/CPC/NIA/MVA): pick ONLY from the numbered menu below.\n"
             "For NEW codes (BNS/BNSS/BSA): identify section numbers you know apply. "
             "Each will be verified against Indian Kanoon — only confirmed sections are used.\n\n"
             f"Case Facts:\n{_to_json(facts)}\n\n"
-            f"Dispossession Track: {track}\n"
+            f"Accident Sub-type: {track}\n"
             f"Law Version Context: {law_ctx}\n"
             f"Fuzziness Flags: {_to_json(flags)}\n\n"
             f"AVAILABLE SECTIONS:\n{menu_text}\n\n"
             "Return ONLY a valid JSON array. Each element:\n"
-            '{"act": "IPC", "section": "441", "reason": "one sentence why it applies"}\n'
+            '{"act": "MVA", "section": "166", "reason": "one sentence why it applies"}\n'
             "Return ONLY the JSON array, no markdown, no explanation."
         )
 
@@ -619,15 +617,14 @@ async def readiness_analysis_node(state: CaseState) -> dict:
         flags = state.get("fuzziness_flags", [])
         precedents = state.get("precedents", [])
 
+        from app.legal_data.Motor_accident_schema import MOTOR_ACCIDENT_FIELDS
+        schema_field_names = [f["field_name"] for f in MOTOR_ACCIDENT_FIELDS]
+
         system_prompt = inject_policy(READINESS_ANALYSIS_PROMPT.format(
             facts_json=_to_json(facts),
             fuzziness_flags=_to_json(flags),
             retrieved_citations_json=_to_json(precedents),
-            property_schema_fields=json.dumps([
-                "dispossession_recency", "property_identification", "ownership_chain",
-                "other_party_identity_and_relationship", "how_dispossession_happened",
-                "self_help_attempted_by_client", "documents_available",
-            ]),
+            property_schema_fields=json.dumps(schema_field_names),
         ))
 
         response = await llm.ainvoke([
@@ -648,12 +645,8 @@ async def readiness_analysis_node(state: CaseState) -> dict:
 
         # Compute defaults from state for any missing fields
         filled_fields = {f.field for f in facts}
-        schema_fields = {
-            "dispossession_recency", "property_identification", "ownership_chain",
-            "other_party_identity_and_relationship", "how_dispossession_happened",
-            "self_help_attempted_by_client", "documents_available",
-        }
-        completeness = len(filled_fields & schema_fields) / len(schema_fields)
+        schema_fields = set(schema_field_names)
+        completeness = len(filled_fields & schema_fields) / max(len(schema_fields), 1)
         open_high_flags = [f for f in flags if not f.resolved and f.severity in ("high", "medium")]
         doc_facts = [f for f in facts if f.evidence_type == "DOCUMENT_EXTRACTED"]
         doc_corr = len(doc_facts) / max(len(facts), 1)

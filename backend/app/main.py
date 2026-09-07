@@ -40,15 +40,11 @@ from app.agents.ocr_agent import extract_document
 from app.config import GOOGLE_API_KEY, MODEL_FLASH
 from app.graphs.analysis_graph import analysis_graph
 from app.graphs.intake_graph import intake_graph
-from app.legal_data.property_dispute_schema import get_missing_fields
+from app.legal_data.Motor_accident_schema import get_missing_fields
 from app.state import (
     CaseState,
-    CitationRecord,
     ConsentRecord,
     DocumentRecord,
-    Fact,
-    FuzzinessFlag,
-    ReadinessSignals,
 )
 
 # ---------------------------------------------------------------------------
@@ -182,9 +178,10 @@ def _initial_state(
     return {
         "thread_id": thread_id,
         "language": language,
-        "case_type": "property_dispute",
+        "case_type": "motor_accident",
         "law_version_context": "unknown",
-        "dispossession_track": "not_determined",
+        "dispossession_track": "not_determined",  # retained for state schema compat
+        "accident_subtype": "not_applicable",
         "intake_phase": "open_narrative",
         "messages": [],
         "facts": [],
@@ -238,7 +235,6 @@ async def _handle_start_intake(session_id: str, args: dict) -> dict:
 async def _handle_submit_client_response(session_id: str, args: dict) -> dict:
     """Append client answer to conversation, run entity tracker and fuzziness detector."""
     raw_answer = args.get("raw_answer", "")
-    turn_id = args.get("turn_id", f"turn_{uuid.uuid4().hex[:8]}")
     topic = args.get("topic", "general")
 
     if not raw_answer:
@@ -247,13 +243,12 @@ async def _handle_submit_client_response(session_id: str, args: dict) -> dict:
     # Resume the graph with the client's answer
     from langgraph.types import Command
     try:
-        state_snapshot = await intake_graph.ainvoke(
+        await intake_graph.ainvoke(
             Command(resume=raw_answer),
             config=_graph_config(session_id),
         )
     except Exception as exc:
         logger.error("Graph resume error for session %s: %s", session_id, exc)
-        state_snapshot = {}
 
     current_state = _get_current_state(session_id)
 
@@ -389,7 +384,6 @@ async def _handle_trigger_analysis(
 
 async def _handle_confirm_step(session_id: str, args: dict) -> dict:
     """Resume the confirmation flow graph with the client's consent answer."""
-    step = args.get("step", "recipient")
     confirmed = args.get("confirmed", False)
 
     answer = "haan" if confirmed else "nahin"

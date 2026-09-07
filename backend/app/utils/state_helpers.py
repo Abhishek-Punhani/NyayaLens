@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Optional
+from typing import Optional
 
 from app.state import CaseState, Fact, FuzzinessFlag
 
@@ -70,11 +70,8 @@ def get_document_facts(facts: list[Fact]) -> list[Fact]:
 
 
 def schema_completeness(facts: list[Fact]) -> float:
-    """Fraction of property-dispute schema fields that have been collected."""
-    schema_fields = {
-        "dispossession_recency", "property_identification", "ownership_chain",
-        "other_party_identity_and_relationship", "how_dispossession_happened",
-        "self_help_attempted_by_client", "documents_available",
-    }
+    """Fraction of motor accident schema fields that have been collected."""
+    from app.legal_data.Motor_accident_schema import MOTOR_ACCIDENT_FIELDS
+    schema_fields = {f["field_name"] for f in MOTOR_ACCIDENT_FIELDS}
     filled = {f.field for f in facts} & schema_fields
-    return len(filled) / len(schema_fields)
+    return len(filled) / max(len(schema_fields), 1)
