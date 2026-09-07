@@ -744,8 +744,8 @@ async def startup_event():
     logger.info("NyayaLens backend v3 starting up")
     logger.info("API key set: %s", bool(GOOGLE_API_KEY))
     # Auto-seed ChromaDB corpus if collection is empty and key is real
-    from app.startup import seed_corpus_if_empty
-    asyncio.create_task(seed_corpus_if_empty())
+    from app.startup import validate_startup_config
+    asyncio.create_task(validate_startup_config())
 
 
 @app.on_event("shutdown")

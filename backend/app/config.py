@@ -14,15 +14,27 @@ if not GOOGLE_API_KEY:
     )
 
 # ---------------------------------------------------------------------------
+# Indian Kanoon API
+# ---------------------------------------------------------------------------
+INDIAN_KANOON_TOKEN = os.getenv("INDIAN_KANOON_TOKEN", "")
+
+if not INDIAN_KANOON_TOKEN:
+    import warnings
+    warnings.warn(
+        "INDIAN_KANOON_TOKEN is not set. Add it to .env — legal research calls will fail.",
+        RuntimeWarning,
+        stacklevel=2,
+    )
+
+# ---------------------------------------------------------------------------
 # Latest Gemini Models (September 2026)
 # ---------------------------------------------------------------------------
-MODEL_VOICE  = os.getenv("MODEL_VOICE", "gemini-3.1-flash-live-preview")   # Realtime audio dialog
-MODEL_PRO    = os.getenv("MODEL_PRO",   "gemini-3.1-pro-preview")          # Deep legal reasoning
-MODEL_FLASH  = os.getenv("MODEL_FLASH", "gemini-3.7-flash")                # Fast extraction agents
+MODEL_VOICE  = os.getenv("MODEL_VOICE",  "gemini-3.1-flash-live-preview")   # Realtime audio dialog
+MODEL_PRO    = os.getenv("MODEL_PRO",    "gemini-3.1-pro-preview")          # Deep legal reasoning
+MODEL_FLASH  = os.getenv("MODEL_FLASH",  "gemini-3.7-flash")                # Fast extraction agents
+MODEL_SEARCH = os.getenv("MODEL_SEARCH", "gemini-2.5-flash")                # Keyword generation & search queries
 
 # ---------------------------------------------------------------------------
 # Storage & Paths
 # ---------------------------------------------------------------------------
-CHROMA_DB_PATH          = os.getenv("CHROMA_DB_PATH", "./chroma_db")
 SQLITE_CHECKPOINT_PATH  = os.getenv("SQLITE_CHECKPOINT_PATH", "./checkpoints.db")
-CORPUS_PATH             = os.getenv("CORPUS_PATH", "./app/legal_data/judgments.json")

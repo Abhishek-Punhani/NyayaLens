@@ -13,9 +13,8 @@ from typing import Any
 
 from langchain_google_genai import ChatGoogleGenerativeAI
 
-from app.config import GOOGLE_API_KEY, MODEL_FLASH, MODEL_PRO
-from app.legal_data.corpus_builder import search_corpus
-from app.legal_data.section_mapping import PROPERTY_DISPUTE_SECTIONS
+from app.config import GOOGLE_API_KEY, MODEL_FLASH, MODEL_PRO, MODEL_SEARCH
+from app.tools.indian_kanoon import research_query
 from app.prompts.analysis_prompts import (
     ARGUMENT_HYPOTHESIS_PROMPT,
     LAWYER_CHAT_PROMPT,
@@ -56,6 +55,16 @@ def _flash_llm() -> ChatGoogleGenerativeAI:
         model=MODEL_FLASH,
         google_api_key=GOOGLE_API_KEY,
         temperature=0.1,
+        max_retries=2,
+    )
+
+
+def _search_llm() -> ChatGoogleGenerativeAI:
+    """gemini-2.5-flash — used exclusively for search query generation and keyword extraction."""
+    return ChatGoogleGenerativeAI(
+        model=MODEL_SEARCH,
+        google_api_key=GOOGLE_API_KEY,
+        temperature=0.2,
         max_retries=2,
     )
 
@@ -103,142 +112,304 @@ def _validate_citation(raw: dict) -> CitationRecord | None:
         contradiction_or_limit=raw.get("contradiction_or_limit"),
     )
 
-
-def _build_static_citations(track: str) -> list[CitationRecord]:
-    """Return pre-verified statutory citations appropriate to the track."""
-    citations: list[CitationRecord] = []
-    if track in ("section_6", "unclear", "not_determined"):
-        s = PROPERTY_DISPUTE_SECTIONS["SRA_6"]
-        citations.append(CitationRecord(
-            source_id="SRA_6_1963",
-            source_url="https://indiankanoon.org/doc/1054366/",
-            exact_citation=s["exact_citation"],
-            supporting_passage=s["summary"],
-            jurisdiction="India",
-            date="1963",
-            applicability_status=s["applicability_status"],
-        ))
-        citations.append(CitationRecord(
-            source_id="SRA_6_RAME_GOWDA_2004",
-            source_url="https://indiankanoon.org/doc/1507758/",
-            exact_citation="Rame Gowda (Dead) by LRs v. M. Varadappa Naidu, (2004) 1 SCC 769",
-            supporting_passage=(
-                "A person in settled possession cannot be dispossessed without due process of law, "
-                "even by the rightful owner."
-            ),
-            jurisdiction="Supreme Court of India",
-            date="2004",
-            applicability_status="good_law",
-        ))
-    if track in ("title_suit", "unclear"):
-        s = PROPERTY_DISPUTE_SECTIONS["LIMITATION_ART_65"]
-        citations.append(CitationRecord(
-            source_id="LIM_ART65_1963",
-            source_url="https://indiankanoon.org/doc/1317393/",
-            exact_citation=s["exact_citation"],
-            supporting_passage=s["summary"],
-            jurisdiction="India",
-            date="1963",
-            applicability_status=s["applicability_status"],
-        ))
-    return citations
-
-
 # ---------------------------------------------------------------------------
 # Node 1 — Precedent Research Agent  [Pro]
 # ---------------------------------------------------------------------------
 
 async def precedent_research_node(state: CaseState) -> dict:
     """
-    Retrieves relevant judgments from ChromaDB + returns verified statutory
-    citations. Never calls retrieved content 'transcripts' — always 'judgments'.
-    Every CitationRecord is validated for mandatory fields before reaching
-    the Argument Builder.
+    Live case law research via Indian Kanoon API.
+    ONLY fetches judgments (Supreme Court / High Court).
+
+    Statute lookup is fully handled by statute_analysis_node (parallel node).
+    This node does NOT touch statutes at all.
+
+    Flow:
+      1. LLM (gemini-2.5-flash) reads case facts → generates 3-4 targeted
+         judgment search queries.
+      2. Each query hits Indian Kanoon (doctypes:judgments).
+      3. Full text fetched for top 2 results per query.
+      4. Deduplication prevents the same judgment appearing twice.
     """
     try:
-        llm = _pro_llm()
-        facts = state.get("facts", [])
-        flags = state.get("fuzziness_flags", [])
-        track = state.get("dispossession_track", "not_determined")
+        llm     = _search_llm()
+        facts   = state.get("facts", [])
+        flags   = state.get("fuzziness_flags", [])
+        track   = state.get("dispossession_track", "not_determined")
         law_ctx = state.get("law_version_context", "unknown")
 
-        # Start with verified static citations
-        citations: list[CitationRecord] = _build_static_citations(track)
+        citations: list[CitationRecord] = []
+        seen_ids: set[str] = set()
 
-        # Generate search queries via LLM
-        system_prompt = inject_policy(PRECEDENT_RESEARCH_PROMPT.format(
-            facts_json=_to_json(facts),
-            dispossession_track=track,
-            law_version_context=law_ctx,
-            fuzziness_flags=_to_json(flags),
-        ))
+        # ── Step 1: LLM generates targeted case law search queries ──
+        query_prompt = (
+            "You are an expert Indian Legal Research Analyst.\n"
+            "Analyze the case facts below and generate 3-4 targeted search queries "
+            "to find RELEVANT Supreme Court and High Court JUDGMENTS on Indian Kanoon.\n"
+            "Focus on: settled possession, dispossession, property dispute outcomes, "
+            "injunction standards, adverse possession, title suits — whatever the facts point to.\n\n"
+            f"Case Facts:\n{_to_json(facts)}\n\n"
+            f"Dispossession Track: {track}\n"
+            f"Law Version Context: {law_ctx}\n"
+            f"Fuzziness Flags:\n{_to_json(flags)}\n\n"
+            "Return ONLY a valid JSON array of query strings. Examples:\n"
+            '["settled possession without due process Supreme Court India",\n'
+            ' "forcible dispossession tenant injunction High Court",\n'
+            ' "adverse possession title suit limitation 12 years"]\n'
+            "Return ONLY the JSON array, no explanation."
+        )
 
         response = await llm.ainvoke([
-            ("system", system_prompt),
-            ("human", "Return a JSON list of search query strings to find relevant judgments/decisions. Only JSON array."),
+            ("system", inject_policy(query_prompt)),
+            ("human", "Generate the case law search queries as a JSON array."),
         ])
 
         try:
-            queries = _parse_json_block(response.content)
-            if not isinstance(queries, list):
-                queries = [str(queries)]
-        except (json.JSONDecodeError, TypeError):
-            queries = [f"property possession dispossession {track} India"]
+            case_law_queries = _parse_json_block(response.content)
+            if not isinstance(case_law_queries, list):
+                case_law_queries = []
+        except Exception:
+            case_law_queries = []
 
-        # Search ChromaDB corpus
-        for query in queries[:4]:   # cap at 4 queries
+        # Fallback if LLM fails
+        if not case_law_queries:
+            case_law_queries = [f"settled possession dispossession {track} Supreme Court India"]
+
+        case_law_queries = [str(q) for q in case_law_queries if q][:4]
+
+        logger.info("[PrecedentResearch] Generated %d judgment queries", len(case_law_queries))
+
+        # ── Step 2: Fetch live judgments from Indian Kanoon ──
+        for cq in case_law_queries:
             try:
-                results = search_corpus(
-                    query=query,
-                    case_type="property_dispute",
-                    law_version=law_ctx,
-                    n_results=3,
-                )
+                results = await research_query(cq, doctypes="judgments")
                 for res in results:
-                    meta = res.get("metadata", {})
-                    # Build CitationRecord from corpus metadata
-                    cit = CitationRecord(
-                        source_id=res.get("id", f"CORPUS-{uuid.uuid4().hex[:8]}"),
-                        source_url=meta.get("source_url"),
-                        exact_citation=meta.get("exact_citation", res.get("id", "")),
-                        supporting_passage=res.get("document", "")[:300],   # short paraphrase
-                        jurisdiction=meta.get("court", "India"),
-                        date=meta.get("date", "unclear"),
-                        applicability_status=meta.get("applicability_status", "unclear"),
-                        contradiction_or_limit=meta.get("contradiction_or_limit"),
-                    )
-                    if cit.source_id and cit.exact_citation:
-                        citations.append(cit)
-            except Exception as search_err:
-                logger.warning("Corpus search failed for query '%s': %s", query, search_err)
+                    sid = res.get("source_id", "")
+                    if not sid or sid in seen_ids:
+                        continue
+                    if not res.get("exact_citation"):
+                        continue
+                    seen_ids.add(sid)
+                    citations.append(CitationRecord(
+                        source_id=sid,
+                        exact_citation=res["exact_citation"],
+                        source_url=res.get("source_url"),
+                        supporting_passage=res.get("supporting_passage", "")[:500],
+                        jurisdiction=res.get("jurisdiction", "India"),
+                        date=res.get("date", ""),
+                        applicability_status="case_law",
+                        contradiction_or_limit=res.get("contradiction_or_limit"),
+                    ))
+            except Exception as cq_err:
+                logger.warning("[PrecedentResearch] Query '%s' failed: %s", cq, cq_err)
 
-        # BSA §63 citation if electronic evidence in facts
-        has_recording = any(
-            "recording" in f.value.lower() or "video" in f.value.lower() or "whatsapp" in f.value.lower()
-            for f in facts
-        )
-        if has_recording and law_ctx in ("post_2024_codes", "mixed", "unknown"):
-            s = PROPERTY_DISPUTE_SECTIONS["BSA_63"]
-            citations.append(CitationRecord(
-                source_id="BSA_63_2023",
-                source_url="https://prsindia.org/billtrack/the-bharatiya-sakshya-bill-2023",
-                exact_citation=s["exact_citation"],
-                supporting_passage=s["summary"],
-                jurisdiction="India",
-                date="2023",
-                applicability_status=s["applicability_status"],
-            ))
-
+        logger.info("[PrecedentResearch] Retrieved %d unique live judgments", len(citations))
         return {"precedents": citations}
 
     except Exception as exc:
         logger.error("precedent_research_node error: %s", exc, exc_info=True)
-        return {"precedents": _build_static_citations(state.get("dispossession_track", "unclear"))}
+        return {"precedents": []}
+
+
+
+
+
+# ---------------------------------------------------------------------------
+# Node 1b — Statute Analysis Node  [Search LLM + Local JSON DB + IK for new codes]
+# ---------------------------------------------------------------------------
+
+async def statute_analysis_node(state: CaseState) -> dict:
+    """
+    Identifies ALL applicable statutory provisions from the local law database.
+
+    Flow:
+      1. Build a compact "menu" — just section_number + title for each relevant act.
+         Old codes (IPC/CrPC/IEA/CPC…) → sourced from local JSON files (civictech_db/).
+         New codes (BNS/BNSS/BSA) → section titles listed from known ranges.
+      2. LLM (gemini-2.5-flash) reads the menu + case facts → picks only what applies.
+      3. For picked old-code sections → fetch full text from local JSON (0ms, no network).
+      4. For picked new-code sections → fetch verbatim text from Indian Kanoon API.
+      5. Return merged CitationRecords appended to state['precedents'].
+    """
+    import asyncio as _asyncio
+    from app.legal_data.statute_db import (
+        ACT_LABELS, LOCAL_ACTS, LIVE_ACTS,
+        get_section, get_section_index, get_citation_string,
+    )
+
+    try:
+        llm     = _search_llm()
+        facts   = state.get("facts", [])
+        track   = state.get("dispossession_track", "not_determined")
+        law_ctx = state.get("law_version_context", "unknown")
+        flags   = state.get("fuzziness_flags", [])
+
+        # ── Step 1: Build compact section menu from actual JSON DB indexes ──────
+        if law_ctx == "pre_2024_codes":
+            local_acts = ["IPC", "IEA", "CRPC", "CPC", "NIA"]
+            live_acts  = []
+        elif law_ctx == "post_2024_codes":
+            local_acts = ["CPC", "NIA"]
+            live_acts  = ["BNS", "BNSS", "BSA"]
+        else:  # mixed / unknown — both
+            local_acts = ["IPC", "IEA", "CRPC", "CPC", "NIA"]
+            live_acts  = ["BNS", "BNSS", "BSA"]
+
+        menu_lines = []
+
+        # Old codes: section number + title directly from the downloaded JSON files
+        for act in local_acts:
+            idx = get_section_index(act)   # [{section_number, section_title}, ...]
+            if not idx:
+                continue
+            label = ACT_LABELS.get(act, act)
+            menu_lines.append(f"\n{act} ({label}) — {len(idx)} sections:")
+            for s in idx:
+                menu_lines.append(f"  §{s['section_number']} — {s['section_title']}")
+
+        # New codes: no local file exists. Tell LLM which acts to pick from;
+        # it picks section numbers from its own knowledge.
+        # Indian Kanoon API is the verification — only sections IK confirms survive.
+        if live_acts:
+            menu_lines.append("\n--- New codes (events on/after 01-Jul-2024) ---")
+            menu_lines.append("For the acts below, identify section numbers you know are relevant.")
+            menu_lines.append("Each picked section will be verified against Indian Kanoon API.")
+            menu_lines.append("If IK cannot confirm it, it will be dropped. Do not guess wildly.")
+            for act in live_acts:
+                label = ACT_LABELS.get(act, act)
+                menu_lines.append(f"  {act} ({label})")
+
+        menu_text = "\n".join(menu_lines)
+
+        # ── Step 2: LLM picks from menu (old codes) + identifies new code sections ──
+        pick_prompt = (
+            "You are an expert Indian property and criminal law analyst.\n"
+            "Based on the case facts, pick EVERY applicable section:\n\n"
+            "For OLD codes (IPC/IEA/CRPC/CPC/NIA): pick ONLY from the numbered menu below.\n"
+            "For NEW codes (BNS/BNSS/BSA): identify section numbers you know apply. "
+            "Each will be verified against Indian Kanoon — only confirmed sections are used.\n\n"
+            f"Case Facts:\n{_to_json(facts)}\n\n"
+            f"Dispossession Track: {track}\n"
+            f"Law Version Context: {law_ctx}\n"
+            f"Fuzziness Flags: {_to_json(flags)}\n\n"
+            f"AVAILABLE SECTIONS:\n{menu_text}\n\n"
+            "Return ONLY a valid JSON array. Each element:\n"
+            '{"act": "IPC", "section": "441", "reason": "one sentence why it applies"}\n'
+            "Return ONLY the JSON array, no markdown, no explanation."
+        )
+
+        response = await llm.ainvoke([
+            ("system", inject_policy(pick_prompt)),
+            ("human", "Pick all applicable sections as a JSON array."),
+        ])
+
+        try:
+            picked = _parse_json_block(response.content)
+            if not isinstance(picked, list):
+                picked = []
+        except Exception:
+            picked = []
+
+        logger.info("[StatuteAnalysis] LLM picked %d sections for track='%s'", len(picked), track)
+
+        # ── Step 3: Fetch full text ───────────────────────────────────────────
+        statute_citations: list[CitationRecord] = []
+        seen_ids: set[str] = set()
+
+        old_picks  = [p for p in picked if isinstance(p, dict) and str(p.get("act","")).upper() in LOCAL_ACTS]
+        new_picks  = [p for p in picked if isinstance(p, dict) and str(p.get("act","")).upper() in LIVE_ACTS]
+
+        # Old codes — local JSON lookup, zero network calls
+        for prov in old_picks:
+            act     = str(prov.get("act", "")).strip().upper()
+            section = str(prov.get("section", "")).strip()
+            reason  = str(prov.get("reason", ""))
+            if not act or not section:
+                continue
+
+            entry = get_section(act, section)
+            if not entry:
+                logger.debug("[StatuteAnalysis] %s §%s not in local DB", act, section)
+                continue
+
+            cid = f"STATUTE_{act}_{section}"
+            if cid in seen_ids:
+                continue
+            seen_ids.add(cid)
+
+            statute_citations.append(CitationRecord(
+                source_id=cid,
+                exact_citation=get_citation_string(act, section),
+                source_url="https://indiacode.gov.in",
+                supporting_passage=(
+                    f"[{entry.get('section_title', '')}] "
+                    f"{entry.get('section_desc', '')[:450]}"
+                ),
+                jurisdiction=f"India — {ACT_LABELS.get(act, act)}",
+                date="Central Act",
+                applicability_status="statute",
+                contradiction_or_limit=reason,
+            ))
+
+        logger.info("[StatuteAnalysis] %d old-code sections from local JSON", len(statute_citations))
+
+        # New codes — fetch verbatim text from Indian Kanoon API
+        if new_picks:
+            ik_tasks = []
+            for prov in new_picks:
+                act     = str(prov.get("act", "")).strip().upper()
+                section = str(prov.get("section", "")).strip()
+                if act and section:
+                    query = f"Section {section} {ACT_LABELS.get(act, act)}"
+                    ik_tasks.append((prov, query))
+
+            ik_results = await _asyncio.gather(
+                *[research_query(q, doctypes="laws") for _, q in ik_tasks],
+                return_exceptions=True,
+            )
+
+            for (prov, _), result in zip(ik_tasks, ik_results):
+                if isinstance(result, Exception) or not result:
+                    continue
+                act     = str(prov.get("act", "")).strip().upper()
+                section = str(prov.get("section", "")).strip()
+                reason  = str(prov.get("reason", ""))
+                cid     = f"STATUTE_{act}_{section}"
+                if cid in seen_ids:
+                    continue
+                seen_ids.add(cid)
+
+                top = result[0]
+                statute_citations.append(CitationRecord(
+                    source_id=cid,
+                    exact_citation=get_citation_string(act, section),
+                    source_url=top.get("source_url", "https://indiankanoon.org"),
+                    supporting_passage=top.get("supporting_passage", "")[:450],
+                    jurisdiction=f"India — {ACT_LABELS.get(act, act)}",
+                    date=top.get("date", "2024"),
+                    applicability_status="statute",
+                    contradiction_or_limit=reason,
+                ))
+
+            logger.info("[StatuteAnalysis] %d new-code sections fetched from Indian Kanoon", len(new_picks))
+
+        # ── Step 4: Merge with precedents without duplicates ─────────────────
+        existing     = state.get("precedents", []) or []
+        existing_ids = {c.source_id for c in existing if hasattr(c, "source_id")}
+        merged       = list(existing) + [c for c in statute_citations if c.source_id not in existing_ids]
+
+        logger.info("[StatuteAnalysis] Final merged citation count: %d", len(merged))
+        return {"precedents": merged}
+
+    except Exception as exc:
+        logger.error("statute_analysis_node error: %s", exc, exc_info=True)
+        return {}
 
 
 # ---------------------------------------------------------------------------
 # Node 2 — Opposition Case Formulator  [Pro]
 # ---------------------------------------------------------------------------
+
 
 async def opposition_formulator_node(state: CaseState) -> dict:
     """

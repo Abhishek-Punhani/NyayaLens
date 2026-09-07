@@ -15,8 +15,6 @@ langchain-google-genai==4.4.0
 # ── Google GenAI (Gemini Live, Embeddings) ──────────────────────────────────
 google-genai==2.22.0
 
-# ── Vector Store (ChromaDB) ─────────────────────────────────────────────────
-chromadb==1.5.9
 
 # ── Environment & Config ───────────────────────────────────────────────────
 python-dotenv==1.0.1
