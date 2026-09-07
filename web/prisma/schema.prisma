@@ -1,0 +1,35 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = "file:./dev.db"
+}
+
+model Lawyer {
+  id          String    @id @default(cuid())
+  firstName   String
+  lastName    String
+  email       String    @unique
+  password    String
+  phone       String?
+  barCouncilId String?
+  isVerified  Boolean   @default(false)
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  sessions    CaseSession[]
+}
+
+model CaseSession {
+  id          String    @id @default(cuid())
+  lawyerId    String
+  lawyer      Lawyer    @relation(fields: [lawyerId], references: [id])
+  clientName  String?
+  clientPhone String?
+  backendSessionId String  @unique  // The FastAPI thread_id
+  status      String    @default("INTAKE")  // INTAKE | ANALYSIS | DONE
+  shareLink   String    @unique  // Generated sharable link token
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+}
