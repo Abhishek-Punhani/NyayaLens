@@ -18,7 +18,7 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from langgraph.types import interrupt
 
 from app.config import GOOGLE_API_KEY, MODEL_FLASH
-from app.legal_data.property_dispute_schema import get_missing_fields, get_next_priority_field
+from NyayaLens.backend.app.legal_data.Motor_accident_schema import get_missing_fields, get_next_priority_field
 from app.legal_data.section_mapping import get_applicable_law
 from app.prompts.global_policy import inject_policy
 from app.prompts.analysis_prompts import CONFIRMATION_FLOW_PROMPTS
@@ -28,6 +28,7 @@ from app.prompts.intake_prompts import (
     DOCUMENT_REQUEST_PROMPT,
     FACT_EXTRACTION_PROMPT,
     FUZZINESS_DETECTOR_PROMPT,
+    CONSENT_INTENT_PROMPT,
 )
 from app.state import (
     CaseState,
@@ -76,8 +77,10 @@ def _parse_json_block(text: str) -> Any:
 
 async def case_type_router_node(state: CaseState) -> dict:
     """
-    Determines case type from the client's opening narrative and resolves
-    the dispossession-recency track for property disputes.
+    Determines case type from the client's opening narrative and, for motor
+    accident cases, resolves the accident sub-type so downstream nodes know
+    which statutory provisions / embeddings to pull (MV Act sections, IPC/BNS
+    provisions, etc.).
     """
     try:
         messages = state.get("messages", [])
@@ -98,27 +101,26 @@ async def case_type_router_node(state: CaseState) -> dict:
         conversation.append((
             "human",
             "Based on the conversation so far, return JSON with keys: "
-            "case_type (property_dispute|motor_accident|criminal_fir|unknown), "
-            "dispossession_track (section_6|title_suit|unclear|not_determined), "
+            "case_type (motor_accident|criminal_fir|unknown), "
+            "accident_subtype (vehicle_vs_pedestrian|vehicle_vs_cyclist|"
+            "vehicle_vs_motorcyclist|vehicle_vs_vehicle|vehicle_vs_animal|"
+            "vehicle_vs_property|single_vehicle|vehicle_vs_fixed_object|"
+            "not_applicable), "
             "reason (one sentence). Only JSON, no markdown."
         ))
 
         response = await llm.ainvoke(conversation)
         result = _parse_json_block(response.content)
 
-        case_type = result.get("case_type", "property_dispute")
-        track = result.get("dispossession_track", "not_determined")
+        case_type = result.get("case_type", "motor_accident")
+        subtype = result.get("accident_subtype", "not_applicable")
 
-        # Determine law version from event date if known in existing facts
-        facts = state.get("facts", [])
-        event_date_fact = next(
-            (f for f in facts if f.field == "dispossession_recency"), None
-        )
-        law_ctx = get_applicable_law(event_date_fact.value if event_date_fact else None)
+        # Determine applicable law/article context from the accident sub-type
+        law_ctx = get_applicable_law(subtype)
 
         return {
             "case_type": case_type,
-            "dispossession_track": track,
+            "accident_subtype": subtype,
             "law_version_context": law_ctx,
             "intake_phase": "cross_question",
         }
@@ -126,12 +128,11 @@ async def case_type_router_node(state: CaseState) -> dict:
     except Exception as exc:
         logger.error("case_type_router_node error: %s", exc, exc_info=True)
         return {
-            "case_type": "property_dispute",
-            "dispossession_track": "not_determined",
+            "case_type": "motor_accident",
+            "accident_subtype": "not_applicable",
             "law_version_context": "unknown",
             "intake_phase": "cross_question",
         }
-
 
 # ---------------------------------------------------------------------------
 # Node 2 — Cross-Questioning Agent
@@ -139,16 +140,16 @@ async def case_type_router_node(state: CaseState) -> dict:
 
 async def cross_question_node(state: CaseState) -> dict:
     """
-    Conducts the evidence-driven cross-questioning interview.
-    Uses interrupt() to pause the graph and wait for the client's answer.
-    Each new fact is written with evidence_type=CLIENT_STATED.
+    Conducts the evidence-driven cross-questioning interview for motor
+    accident cases. Uses interrupt() to pause the graph and wait for the
+    client's answer. Each new fact is written with evidence_type=CLIENT_STATED.
     """
     try:
         llm = _flash_llm()
         language = state.get("language", "hi")
         facts = state.get("facts", [])
         fuzziness_flags = state.get("fuzziness_flags", [])
-        track = state.get("dispossession_track", "not_determined")
+        subtype = state.get("accident_subtype", "not_applicable")
 
         missing_fields = get_missing_fields(facts)
         unresolved_flags = [f for f in fuzziness_flags if not f.resolved and f.blocks_handoff]
@@ -156,7 +157,7 @@ async def cross_question_node(state: CaseState) -> dict:
         system_prompt = inject_policy(CROSS_QUESTION_PROMPT.format(
             language=language,
             facts_json=_facts_to_json(facts),
-            dispossession_track=track,
+            accident_subtype=subtype,
             missing_fields=json.dumps(missing_fields),
             fuzziness_flags=_flags_to_json(unresolved_flags),
         ))
@@ -242,12 +243,12 @@ async def cross_question_node(state: CaseState) -> dict:
 # ---------------------------------------------------------------------------
 # Node 3 — Fuzziness Detector
 # ---------------------------------------------------------------------------
-
 async def fuzziness_detector_node(state: CaseState) -> dict:
     """
     Runs after every new fact is added. Detects contradictions, timeline
-    conflicts, vague accounts, missing documents, and jurisdiction ambiguity.
-    Never concludes anyone is lying — only flags specific discrepancies.
+    conflicts, vague accounts, missing documents, liability ambiguity, and
+    jurisdiction ambiguity for motor accident cases. Never concludes anyone
+    is lying — only flags specific discrepancies.
     """
     try:
         llm = _flash_llm()
@@ -380,9 +381,10 @@ async def entity_tracker_node(state: CaseState) -> dict:
 
 async def document_request_node(state: CaseState) -> dict:
     """
-    Identifies which documents are needed, issues a specific request for each,
-    and handles the special BSA §63 certificate question for any recordings.
-    Uses interrupt() to wait for the client to upload.
+    Identifies which documents are needed for a motor accident case, issues a
+    specific request for each, and handles the special BSA §63 certificate
+    question for any recordings/CCTV/dashcam footage. Uses interrupt() to
+    wait for the client to upload.
     """
     try:
         llm = _flash_llm()
@@ -411,12 +413,16 @@ async def document_request_node(state: CaseState) -> dict:
         new_docs: list[DocumentRecord] = []
         request_message_parts: list[str] = []
 
+        # Keywords that trigger the BSA §63 electronic-evidence certificate
+        # requirement — broadened for motor accident cases, where CCTV and
+        # dashcam footage are as common as phone recordings.
+        RECORDING_KEYWORDS = ("recording", "video", "whatsapp", "cctv", "dashcam", "audio")
+
         for req in doc_requests:
             doc_id = f"DOC-{uuid.uuid4().hex[:8]}"
-            is_recording = req.get("material_or_optional", "material") == "material" and (
-                "recording" in req.get("document_type", "").lower()
-                or "video" in req.get("document_type", "").lower()
-                or "whatsapp" in req.get("document_type", "").lower()
+            doc_type_lower = req.get("document_type", "").lower()
+            is_recording = req.get("material_or_optional", "material") == "material" and any(
+                kw in doc_type_lower for kw in RECORDING_KEYWORDS
             )
             doc = DocumentRecord(
                 doc_id=doc_id,
@@ -448,39 +454,54 @@ async def document_request_node(state: CaseState) -> dict:
         logger.error("document_request_node error: %s", exc, exc_info=True)
         return {}
 
-
+# ---------------------------------------------------------------------------
+# Node 6 — Confirmation Flow (4-step finite-state consent)
+# ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
 # Node 6 — Confirmation Flow (4-step finite-state consent)
 # ---------------------------------------------------------------------------
 
-_AMBIGUOUS = {"shayad", "pata nahi", "dekh lo", "maybe", "not sure", "hmm", "ummm"}
-_AFFIRMATIVE = {"haan", "yes", "ha", "bhejiye", "theek hai", "ok", "okay", "bilkul", "sure"}
-_NEGATIVE = {"nahin", "nahi", "no", "nope", "mat bhejo", "ruk jao", "cancel"}
 
 
-def _parse_consent(answer: str) -> str:
-    """Returns 'yes', 'no', or 'ambiguous'."""
-    lower = answer.strip().lower()
-    if any(w in lower for w in _AFFIRMATIVE):
-        return "yes"
-    if any(w in lower for w in _NEGATIVE):
-        return "no"
-    if any(w in lower for w in _AMBIGUOUS):
-        return "ambiguous"
-    # Heuristic: short affirmative
-    if len(lower) <= 3 and lower in {"ha", "ok"}:
-        return "yes"
-    return "ambiguous"
+async def _judge_consent(llm, question_asked: str, answer: str) -> tuple[str, str]:
+    """
+    Uses the LLM to judge client intent (yes/no/ambiguous) for a consent
+    question. If the LLM call fails or returns something unparsable, we
+    deliberately default to "ambiguous" rather than guessing — consent must
+    never be silently assumed. This forces the existing retry/pending path
+    to handle it (re-ask, or fall to human review) instead of a keyword
+    heuristic making the call.
+    Returns (verdict, reason).
+    """
+    try:
+        prompt = CONSENT_INTENT_PROMPT.format(
+            question_asked=question_asked,
+            client_reply=answer,
+        )
+        response = await llm.ainvoke([("system", prompt)])
+        parsed = _parse_json_block(response.content)
+        verdict = parsed.get("verdict", "ambiguous")
+        reason = parsed.get("reason", "")
+        if verdict not in ("yes", "no", "ambiguous"):
+            verdict = "ambiguous"
+        return verdict, reason
+    except Exception as exc:
+        logger.warning("Consent LLM classification failed, treating as ambiguous: %s", exc)
+        return "ambiguous", "classification_error_treated_as_ambiguous"
 
 
 async def confirmation_flow_node(state: CaseState) -> dict:
     """
-    4-step finite-state consent flow. Each step is a separate interrupt() call.
-    Only advances on unambiguous confirmation. On any 'no', aborts and returns
-    to intake.
+    4-step finite-state consent flow for a motor accident case brief. Each
+    step is a separate interrupt() call. Consent intent at each step is
+    judged entirely by the LLM (no keyword matching) so partial, hedged, or
+    non-literal replies are handled correctly. Any classification failure is
+    treated as ambiguous, never as an assumed yes/no. Only advances on
+    unambiguous confirmation. On any 'no', aborts and returns to intake.
 
     Writes a ConsentRecord with per-step booleans and a UTC timestamp.
     """
+    llm = _flash_llm()
     facts = state.get("facts", [])
     documents = state.get("documents", [])
     fuzziness_flags = state.get("fuzziness_flags", [])
@@ -490,7 +511,7 @@ async def confirmation_flow_node(state: CaseState) -> dict:
     # Summary strings for the confirmation messages
     facts_summary = f"{len(facts)} baatein"
     timeline_events = state.get("timeline", [])
-    timeline_summary = f"{len(timeline_events)} ghataayein"
+    timeline_summary = f"{len(timeline_events)} ghatnaayein"
     open_flags = [f for f in fuzziness_flags if not f.resolved]
     doc_list = ", ".join(d.doc_type for d in documents) if documents else "koi document nahi"
 
@@ -503,16 +524,17 @@ async def confirmation_flow_node(state: CaseState) -> dict:
     )
     for _attempt in range(2):
         ans1: str = interrupt(value={"spoken_response": step1_prompt, "consent_step": "recipient"})
-        verdict = _parse_consent(ans1)
+        verdict, reason = await _judge_consent(llm, step1_prompt, ans1)
         if verdict == "yes":
             consent.recipient_confirmed = True
             break
         if verdict == "no":
             return {"handoff_status": "declined", "consent": consent}
-        # ambiguous — re-ask once
-        step1_prompt = f"Kripya spasht karein — kya {lawyer_name} ko brief bhejna hai? Sirf 'haan' ya 'nahin' boliye."
+        step1_prompt = (
+            f"Mujhe thoda confusion hua — {reason} Kripya spasht batayein: "
+            f"kya {lawyer_name} ko brief bhejna hai? Sirf 'haan' ya 'nahin' boliye."
+        )
     else:
-        # Still ambiguous after 2 attempts — route to human
         return {"handoff_status": "pending", "consent": consent}
 
     # ── STEP 2 — Contents ─────────────────────────────────────────────────────
@@ -523,13 +545,13 @@ async def confirmation_flow_node(state: CaseState) -> dict:
     )
     for _attempt in range(2):
         ans2: str = interrupt(value={"spoken_response": step2_prompt, "consent_step": "contents"})
-        verdict = _parse_consent(ans2)
+        verdict, reason = await _judge_consent(llm, step2_prompt, ans2)
         if verdict == "yes":
             consent.contents_confirmed = True
             break
         if verdict == "no":
             return {"handoff_status": "declined", "consent": consent}
-        step2_prompt = "Kya brief ke contents theek hain? Sirf 'haan' ya 'nahin' boliye."
+        step2_prompt = f"{reason} Kya brief ke contents theek hain? Sirf 'haan' ya 'nahin' boliye."
     else:
         return {"handoff_status": "pending", "consent": consent}
 
@@ -540,20 +562,24 @@ async def confirmation_flow_node(state: CaseState) -> dict:
     )
     for _attempt in range(2):
         ans3: str = interrupt(value={"spoken_response": step3_prompt, "consent_step": "attachments"})
-        verdict = _parse_consent(ans3)
+        verdict, reason = await _judge_consent(llm, step3_prompt, ans3)
         if verdict == "yes":
             consent.attachments_confirmed = True
             break
         if verdict == "no":
             return {"handoff_status": "declined", "consent": consent}
-        step3_prompt = f"Kya ye {len(documents)} documents attach karne hain? Sirf 'haan' ya 'nahin' boliye."
+        step3_prompt = (
+            f"{reason} Kya ye {len(documents)} documents attach karne hain? "
+            f"Sirf 'haan' ya 'nahin' boliye."
+        )
     else:
         return {"handoff_status": "pending", "consent": consent}
 
     # ── STEP 4 — Final permission ─────────────────────────────────────────────
+    step4_prompt = CONFIRMATION_FLOW_PROMPTS["STEP_4"]
     for _attempt in range(2):
-        ans4: str = interrupt(value={"spoken_response": CONFIRMATION_FLOW_PROMPTS["STEP_4"], "consent_step": "permission"})
-        verdict = _parse_consent(ans4)
+        ans4: str = interrupt(value={"spoken_response": step4_prompt, "consent_step": "permission"})
+        verdict, reason = await _judge_consent(llm, step4_prompt, ans4)
         if verdict == "yes":
             consent.permission_confirmed = True
             consent.timestamp = datetime.now(timezone.utc).isoformat()
@@ -565,5 +591,5 @@ async def confirmation_flow_node(state: CaseState) -> dict:
             }
         if verdict == "no":
             return {"handoff_status": "declined", "consent": consent}
-        # ambiguous
+        step4_prompt = f"{reason} Kripya final permission dein — sirf 'haan' ya 'nahin' boliye."
     return {"handoff_status": "pending", "consent": consent}
