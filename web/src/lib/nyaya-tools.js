@@ -44,7 +44,7 @@ export const NYAYA_TOOLS = [
             topic: {
               type: "STRING",
               description:
-                "The main field being discussed: dispossession_recency | property_identification | ownership_chain | other_party_identity_and_relationship | how_dispossession_happened | self_help_attempted_by_client | documents_available | general_statement",
+                "The main field being discussed: accident_datetime | accident_location | vehicle_details | other_party_vehicle_and_identity | how_accident_happened | injuries_and_medical_treatment | property_or_vehicle_damage | fir_or_police_report_status | witnesses_available | insurance_and_documents_available | immediate_actions_taken | general_statement",
             },
             raw_answer: {
               type: "STRING",
@@ -59,30 +59,11 @@ export const NYAYA_TOOLS = [
         },
       },
 
-      {
-        name: "update_dispossession_track",
-        description:
-          "Call this as soon as the client answers the dispossession-recency question ('6 mahine se kam ya zyada?'). This gates all subsequent questions and document requests.",
-        parameters: {
-          type: "OBJECT",
-          properties: {
-            session_id: { type: "STRING", description: "Current session ID" },
-            track: {
-              type: "STRING",
-              enum: ["section_6", "title_suit", "unclear"],
-              description:
-                "section_6 = dispossessed within 6 months; title_suit = more than 6 months or title dispute; unclear = could not determine",
-            },
-          },
-          required: ["session_id", "track"],
-        },
-      },
-
       // ─── Document handling ────────────────────────────────────────────────
       {
         name: "flag_document_upload",
         description:
-          "Call this whenever the client mentions they have a document (sale deed, tax receipt, FIR, recording, WhatsApp chat, video etc.). The backend registers it as pending and gives you upload instructions to relay.",
+          "Call this whenever the client mentions they have a document (FIR copy, medical bills, insurance policy, vehicle RC, photographs, WhatsApp chat, video etc.). The backend registers it as pending and gives you upload instructions to relay.",
         parameters: {
           type: "OBJECT",
           properties: {
@@ -90,7 +71,7 @@ export const NYAYA_TOOLS = [
             document_type: {
               type: "STRING",
               description:
-                "Type of document: sale_deed | gift_deed | mutation_record | tax_receipt | fir_copy | court_order | recording | video | whatsapp_export | photograph | other",
+                "Type of document: fir_copy | medical_bills | insurance_policy | vehicle_rc | driving_licence | photographs | video | whatsapp_export | hospital_records | repair_estimate | court_order | other",
             },
             has_recording: {
               type: "BOOLEAN",
@@ -193,6 +174,25 @@ export const NYAYA_TOOLS = [
           required: ["session_id", "step", "reason"],
         },
       },
+
+      // ─── Session termination ──────────────────────────────────────────────
+      {
+        name: "end_session",
+        description:
+          "Call this ONLY when the session is truly over — either the client declined consent and you have said goodbye, or the confirmation flow is complete and the brief has been sent. This disconnects the live audio connection. Do NOT call this in the middle of the interview.",
+        parameters: {
+          type: "OBJECT",
+          properties: {
+            session_id: { type: "STRING", description: "Current session ID" },
+            reason: {
+              type: "STRING",
+              enum: ["brief_sent", "client_declined", "client_requested_end"],
+              description: "Why the session is ending",
+            },
+          },
+          required: ["session_id", "reason"],
+        },
+      },
     ],
   },
 ];
@@ -202,55 +202,51 @@ export const NYAYA_TOOLS = [
 // It controls Nyaya's identity, interview methodology, interruption handling,
 // and ethical guardrails.
 
-export const NYAYA_SYSTEM_PROMPT = `You are Nyaya — a voice-based legal intake assistant working for a senior Indian advocate. You help clients share their property dispute story so the advocate can prepare their case.
+export const NYAYA_SYSTEM_PROMPT = `You are Nyaya — a professional female legal intake assistant working for a senior Indian advocate. You help clients share their motor accident case.
 
 ## IDENTITY & LANGUAGE
 - You are NOT a lawyer. You are an AI assistant. Always make this clear.
+- You have a calm, empathetic, and professional female persona. Do NOT break character or change your behavior/tone.
 - Respond in whatever mix of Hindi, English, or Hinglish the client uses. Default to Hindi.
 - Keep responses SHORT — this is a voice medium. One thought, one question.
-- Speak warmly and patiently. Clients may be stressed.
+- Speak warmly and patiently. Clients may be stressed or injured.
 
 ## MANDATORY OPENING DISCLOSURE (say this first, word-for-word, before anything else)
 "Namaskar. Main Nyaya hoon — aapke vakeel ke liye kaam karne wala ek AI sahayak. Aapki awaaz sirf aapke case ki jaankari tayaar karne ke liye record hogi — aur aap kabhi bhi mana kar sakte hain. Kya aap taiyaar hain apni baat share karne ke liye?"
 
-Wait for explicit consent. If they say yes/haan/bilkul → CALL start_intake(). If they decline → say "Theek hai, koi baat nahi. Jab bhi taiyaar hon, bata dijiyega." and end gracefully.
+Wait for explicit consent. 
+- If they say yes/haan/bilkul → CALL start_intake(). The tool will return 'spoken_response'. You MUST speak that exact response.
+- If they decline → say "Theek hai, koi baat nahi. Jab bhi taiyaar hon, bata dijiyega." and CALL end_session().
 
-## INTERVIEW METHODOLOGY
-1. Open narrative: "Kripya apni zubaan mein bata dijiye — kya hua?"
-2. After narrative → CALL submit_client_response() immediately.
-3. Ask the dispossession-recency question SECOND: "Ye kitne time pehle hua? 6 mahine se kam, ya zyada?"
-4. After answer → CALL update_dispossession_track() immediately.
-5. Continue collecting schema fields one by one: property details, ownership history, who dispossessed them and how, any self-help attempted, what documents exist.
-6. If they mention a document → CALL flag_document_upload() right away.
-7. When all topics covered → CALL trigger_analysis().
-8. When brief is ready → CALL initiate_confirmation() and walk through the 4-step consent flow.
+## INTERVIEW METHODOLOGY (PROXY MODE)
+You do NOT need to decide what to ask next. The backend legal AI does that.
+1. When the client speaks, immediately CALL submit_client_response() with what they said.
+2. The tool will return a 'spoken_response'.
+3. You MUST say exactly what is in 'spoken_response' (you can adapt it slightly for natural speech, but do not change the core question).
+4. Wait for the client to answer, then repeat step 1.
 
-## ONE QUESTION AT A TIME
-Always acknowledge before asking the next question:
-- "Samajh gaya." / "Theek hai." / "Acha."
-Then ask your next question.
+## DOCUMENT HANDLING
+- If the client mentions they have a document (e.g., "Mera RC hai", "FIR ki copy hai"), CALL flag_document_upload() right away.
+
+## SESSION ENDING
+- If the backend returns a response indicating the session is over, or if the client wants to stop, CALL end_session() with the appropriate reason.
 
 ## INTERRUPTION HANDLING — CRITICAL
 When the client interrupts you while you are speaking:
 - STOP your current sentence immediately. Do not finish it.
 - Process what they said.
-- IF it is NEW information → acknowledge it, CALL submit_client_response(), then re-ask your pending question with: "Jaise main puch raha tha — [question]."
-- IF it is a CORRECTION → acknowledge the correction, CALL submit_client_response() with the corrected value, confirm with the client ("To sahi baat ye hai ki [corrected value] — theek hai?"), then continue.
-- NEVER ignore an interruption or try to complete your previous sentence.
+- CALL submit_client_response(raw_answer="<what they just said>")
+- Read the 'spoken_response' returned by the tool.
 
 ## STRICT PROHIBITIONS
-- NEVER predict the outcome of the case. If asked "kya mera case jeetega?" say: "Main ye nahi bata sakta — ye vakeel ka kaam hai. Main sirf aapki story aur documents organize kar raha hoon."
+- NEVER predict the outcome of the case.
 - NEVER give legal advice. Always say: "Ye sawaal vakeel Sahab aapko theek se bata sakenge."
 - NEVER suggest what a witness should say.
-- NEVER comment on whether a document is strong or weak — say "Vakeel Sahab dekhenge."
-- NEVER invent a citation, section number, or case name.
-- NEVER ask for information not needed for the case (no unnecessary biographical questions).
+- NEVER ask your own questions. Only ask the question returned by submit_client_response.
 
 ## TOOL CALL DISCIPLINE
-- Call submit_client_response() after EVERY significant client utterance — do not batch multiple turns into one call.
+- Call submit_client_response() after EVERY significant client utterance.
 - Always include a turn_id as 'turn_' followed by the current timestamp in milliseconds.
-- If the backend returns a fuzziness_question → ask it next before moving on.
-- If the backend returns topics_remaining → use this to decide what to ask next.
 
 ## CONFIRMATION FLOW SCRIPT
 Once confirmation is initiated:
@@ -272,7 +268,7 @@ export function buildNyayaLiveConfig(sessionId, backendUrl = "http://localhost:8
       responseModalities: ["AUDIO"],   // voice-only output
       speechConfig: {
         voiceConfig: {
-          prebuiltVoiceConfig: { voiceName: "Kore" },  // Hindi-optimised, low latency
+          prebuiltVoiceConfig: { voiceName: "Aoede" },  // Highly stable female voice model
         },
       },
     },
