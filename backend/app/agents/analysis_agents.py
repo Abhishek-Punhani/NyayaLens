@@ -393,13 +393,13 @@ async def statute_analysis_node(state: CaseState) -> dict:
 
             logger.info("[StatuteAnalysis] %d new-code sections fetched from Indian Kanoon", len(new_picks))
 
-        # ── Step 4: Merge with precedents without duplicates ─────────────────
+        # ── Step 4: Return new citations (LangGraph operator.add will append them) ──
         existing     = state.get("precedents", []) or []
         existing_ids = {c.source_id for c in existing if hasattr(c, "source_id")}
-        merged       = list(existing) + [c for c in statute_citations if c.source_id not in existing_ids]
+        new_only     = [c for c in statute_citations if c.source_id not in existing_ids]
 
-        logger.info("[StatuteAnalysis] Final merged citation count: %d", len(merged))
-        return {"precedents": merged}
+        logger.info("[StatuteAnalysis] Returning %d new statutory citations", len(new_only))
+        return {"precedents": new_only}
 
     except Exception as exc:
         logger.error("statute_analysis_node error: %s", exc, exc_info=True)

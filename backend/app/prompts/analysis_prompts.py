@@ -92,7 +92,7 @@ Facts: {facts_json}
 ARGUMENT_HYPOTHESIS_PROMPT = """You are an argument hypothesis agent.
 Use ONLY:
 - confirmed facts (CLIENT_STATED or DOCUMENT_EXTRACTED evidence_type)
-- citations actually returned by Precedent Research this run
+- statutory provisions and case law judgments retrieved by the legal research nodes this run
 - opposition weak points (for counter-rebuttals)
 
 For each hypothesis, output:

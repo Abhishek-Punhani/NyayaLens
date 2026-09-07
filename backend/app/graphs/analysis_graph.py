@@ -16,17 +16,15 @@ from app.agents.analysis_agents import (
 
 
 def fan_out_analysis(state: CaseState):
-    """Fan out to four independent agents in parallel.
+    """Fan out to independent agents in parallel.
 
     precedent_research  — live Indian Kanoon judgment search
     statute_analysis    — local civictech JSON DB + IK for BNS/BNSS/BSA sections
-    opposition_formulator — builds the other side's case
     witness_candidate   — identifies witnesses
     """
     return [
         Send("precedent_research",   state),
         Send("statute_analysis",     state),
-        Send("opposition_formulator", state),
         Send("witness_candidate",    state),
     ]
 
@@ -45,13 +43,18 @@ def build_analysis_graph():
     builder.add_conditional_edges(
         START,
         fan_out_analysis,
-        ["precedent_research", "statute_analysis", "opposition_formulator", "witness_candidate"],
+        ["precedent_research", "statute_analysis", "witness_candidate"],
     )
 
-    # Both citation nodes (judgments + statutes) feed into argument builder
-    builder.add_edge("precedent_research",   "argument_builder")
-    builder.add_edge("statute_analysis",     "argument_builder")
+    # Research nodes must finish BEFORE opposition formulator runs,
+    # so the opposition can actually cite the retrieved laws.
+    builder.add_edge("precedent_research",   "opposition_formulator")
+    builder.add_edge("statute_analysis",     "opposition_formulator")
+    
+    # Opposition formulator feeds into argument builder
     builder.add_edge("opposition_formulator", "argument_builder")
+    
+    # Witness goes directly to compiler
     builder.add_edge("witness_candidate",    "packet_compiler")
 
     builder.add_edge("argument_builder",  "readiness_analysis")
