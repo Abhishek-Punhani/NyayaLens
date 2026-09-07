@@ -26,6 +26,7 @@ from fastapi import (
     File,
     Form,
     HTTPException,
+    Request,
     UploadFile,
     WebSocket,
     WebSocketDisconnect,
@@ -183,6 +184,8 @@ def _initial_state(
         "dispossession_track": "not_determined",  # retained for state schema compat
         "accident_subtype": "not_applicable",
         "intake_phase": "open_narrative",
+        "interview_stage": "engage",
+        "client_profile": {},
         "messages": [],
         "facts": [],
         "documents": [],
@@ -220,20 +223,24 @@ async def _handle_start_intake(session_id: str, args: dict) -> dict:
     initial["messages"] = [opening]
 
     await intake_graph.ainvoke(initial, config=_graph_config(session_id))
+    
+    # Graph is now paused at the first interrupt() in cross_question_node
+    snapshot = intake_graph.get_state(_graph_config(session_id))
+    interrupt_value = snapshot.tasks[0].interrupts[0].value if snapshot.tasks and snapshot.tasks[0].interrupts else {}
+    
     await broadcast(session_id, {"event": "intake_started", "session_id": session_id})
+
+    # The backend LLM generates the engage phase question
+    spoken_response = interrupt_value.get("spoken_response", "Namaskar. Pehle main aapko bata doon ki aap yahaan safe hain. Apni poori baat batayein.")
 
     return {
         "status": "started",
-        "spoken_response": (
-            "Namaskar. Main Nyaya hoon — ek AI sahayak jo aapke vakeel ke liye kaam karta hai. "
-            "Aapki awaaz sirf case brief banane ke liye record hogi — aap kabhi bhi mana kar sakte hain. "
-            "Kya aap taiyaar hain apni baat share karne ke liye?"
-        ),
+        "spoken_response": spoken_response,
     }
 
 
 async def _handle_submit_client_response(session_id: str, args: dict) -> dict:
-    """Append client answer to conversation, run entity tracker and fuzziness detector."""
+    """Append client answer to conversation, run entity tracker, and get next question."""
     raw_answer = args.get("raw_answer", "")
     topic = args.get("topic", "general")
 
@@ -250,11 +257,15 @@ async def _handle_submit_client_response(session_id: str, args: dict) -> dict:
     except Exception as exc:
         logger.error("Graph resume error for session %s: %s", session_id, exc)
 
-    current_state = _get_current_state(session_id)
+    # After running, the graph should be paused at the next interrupt() call
+    # (either in cross_question_node, document_request_node, or confirmation_flow_node)
+    snapshot = intake_graph.get_state(_graph_config(session_id))
+    interrupt_value = snapshot.tasks[0].interrupts[0].value if snapshot.tasks and snapshot.tasks[0].interrupts else {}
+    
+    current_state = snapshot.values
 
-    # Detect what changed
     fuzziness_flags = current_state.get("fuzziness_flags", []) if current_state else []
-    unresolved = [f for f in fuzziness_flags if not f.resolved and f.blocks_handoff]
+    unresolved = [f for f in fuzziness_flags if not f.resolved]
     missing = get_missing_fields(current_state.get("facts", []) if current_state else [])
 
     await broadcast(session_id, {
@@ -262,27 +273,18 @@ async def _handle_submit_client_response(session_id: str, args: dict) -> dict:
         "topic": topic,
         "fuzziness_count": len(unresolved),
         "missing_fields": missing,
+        "interview_stage": current_state.get("interview_stage", "engage"),
     })
 
-    spoken_response = ""
-    fuzziness_question = None
-
-    # Return next fuzziness clarification if blocking flags exist
-    if unresolved:
-        fuzziness_question = unresolved[0].neutral_clarifying_question
-        spoken_response = fuzziness_question
-        await broadcast(session_id, {
-            "event": "flag_raised",
-            "flag": unresolved[0].model_dump(),
-        })
+    # The backend LLM generates the exact spoken response we want the Voice Agent to say.
+    spoken_response = interrupt_value.get("spoken_response", "Acha, aage batayein.")
 
     return {
         "status": "recorded",
         "fuzziness_detected": len(unresolved) > 0,
-        "fuzziness_question": fuzziness_question,
         "spoken_response": spoken_response,
-        "next_priority_field": missing[0] if missing else None,
         "topics_remaining": missing,
+        "interview_stage": current_state.get("interview_stage", "engage"),
     }
 
 
@@ -627,6 +629,90 @@ async def get_packet(thread_id: str):
         "json": current.get("lawyer_packet_json", {}),
         "whatsapp_summary": current.get("lawyer_packet_json", {}).get("whatsapp_summary", ""),
     }
+
+
+@app.post("/api/session/{thread_id}/accept-case")
+async def accept_case(thread_id: str, background_tasks: BackgroundTasks):
+    """Called by lawyer when they accept a case. Triggers deep analysis pipeline."""
+    if thread_id not in active_sessions:
+        raise HTTPException(status_code=404, detail="Session not found")
+    
+    active_sessions[thread_id]["status"] = "ANALYSIS"
+    await broadcast(thread_id, {"event": "analysis_started", "session_id": thread_id})
+    
+    current = _get_current_state(thread_id)
+    if current is None:
+        raise HTTPException(status_code=404, detail="Session state not found")
+
+    async def _run_deep_analysis():
+        try:
+            await broadcast(thread_id, {
+                "event": "sse_event",
+                "kind": "stage",
+                "status": "start",
+                "id": str(uuid.uuid4()),
+                "content": {"stage": "pipeline_init", "message": "Deep analysis pipeline initializing..."}
+            })
+            await analysis_graph.ainvoke(current, config=_graph_config(thread_id))
+            final = _get_current_state(thread_id)
+            if final and final.get("readiness_signals"):
+                rs = final["readiness_signals"]
+                await broadcast(thread_id, {
+                    "event": "readiness_ready",
+                    "readiness": rs.model_dump() if hasattr(rs, "model_dump") else rs,
+                })
+            if final and final.get("lawyer_packet_markdown"):
+                await broadcast(thread_id, {"event": "packet_ready"})
+            await broadcast(thread_id, {
+                "event": "sse_event",
+                "kind": "stage",
+                "status": "completed",
+                "id": str(uuid.uuid4()),
+                "content": {"stage": "pipeline_done", "message": "Deep analysis complete. Lawyer packet ready."}
+            })
+            await broadcast(thread_id, {"event": "analysis_complete"})
+        except Exception as exc:
+            logger.error("Deep analysis failed for %s: %s", thread_id, exc)
+            await broadcast(thread_id, {"event": "analysis_error", "error": str(exc)})
+
+    task = asyncio.create_task(_run_deep_analysis())
+    analysis_tasks[thread_id] = task
+    active_sessions[thread_id]["status"] = "ANALYSIS"
+    
+    return {"status": "analysis_started", "session_id": thread_id}
+
+
+@app.get("/api/session/{thread_id}/analysis/stream")
+async def analysis_sse_stream(thread_id: str, request: Request):
+    """SSE stream specifically for the deep analysis pipeline events."""
+    if thread_id not in active_sessions:
+        raise HTTPException(status_code=404, detail="Session not found")
+    
+    queue: asyncio.Queue = asyncio.Queue()
+    if thread_id not in sse_subscribers:
+        sse_subscribers[thread_id] = []
+    sse_subscribers[thread_id].append(queue)
+
+    async def event_generator():
+        try:
+            yield f"data: {json.dumps({'type': 'connected', 'session_id': thread_id})}\n\n"
+            while True:
+                if await request.is_disconnected():
+                    break
+                try:
+                    payload = await asyncio.wait_for(queue.get(), timeout=30.0)
+                    yield f"data: {json.dumps(payload)}\n\n"
+                except asyncio.TimeoutError:
+                    yield f"data: {json.dumps({'type': 'heartbeat'})}\n\n"
+        finally:
+            if thread_id in sse_subscribers:
+                sse_subscribers[thread_id].remove(queue)
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream", headers={
+        "Cache-Control": "no-cache",
+        "X-Accel-Buffering": "no",
+        "Connection": "keep-alive",
+    })
 
 
 @app.post("/api/session/{thread_id}/chat")

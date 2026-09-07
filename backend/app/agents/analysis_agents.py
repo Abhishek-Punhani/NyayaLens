@@ -9,7 +9,24 @@ from __future__ import annotations
 import json
 import logging
 import uuid
+import asyncio
 from typing import Any
+
+_sse_queue: asyncio.Queue | None = None
+
+def set_sse_broadcast(q: asyncio.Queue) -> None:
+    global _sse_queue
+    _sse_queue = q
+
+async def _broadcast(stage: str, status: str, message: str, summary: str = "") -> None:
+    if _sse_queue is not None:
+        event = {
+            "kind": "stage" if status == "start" else "agent_complete",
+            "status": status,
+            "content": {"stage": stage, "message": message} if status == "start" else {"agent": stage, "summary": summary},
+            "id": str(uuid.uuid4())
+        }
+        await _sse_queue.put(event)
 
 from langchain_google_genai import ChatGoogleGenerativeAI
 
@@ -128,6 +145,7 @@ async def precedent_research_node(state: CaseState) -> dict:
       3. Full text fetched for top 2 results per query.
       4. Deduplication prevents the same judgment appearing twice.
     """
+    await _broadcast("precedent_research", "start", "Precedent Agent: Searching Indian Kanoon for similar MACT cases...")
     try:
         llm     = _search_llm()
         facts   = state.get("facts", [])
@@ -202,10 +220,12 @@ async def precedent_research_node(state: CaseState) -> dict:
                 logger.warning("[PrecedentResearch] Query '%s' failed: %s", cq, cq_err)
 
         logger.info("[PrecedentResearch] Retrieved %d unique live judgments", len(citations))
+        await _broadcast("precedent_research", "completed", "", f"Retrieved {len(citations)} judgments")
         return {"precedents": citations}
 
     except Exception as exc:
         logger.error("precedent_research_node error: %s", exc, exc_info=True)
+        await _broadcast("precedent_research", "completed", "", "Failed to retrieve judgments")
         return {"precedents": []}
 
 
@@ -229,6 +249,7 @@ async def statute_analysis_node(state: CaseState) -> dict:
       4. For picked new-code sections → fetch verbatim text from Indian Kanoon API.
       5. Return merged CitationRecords appended to state['precedents'].
     """
+    await _broadcast("statute_analysis", "start", "Statute Agent: Mapping applicable MV Act sections...")
     import asyncio as _asyncio
     from app.legal_data.statute_db import (
         ACT_LABELS, LOCAL_ACTS, LIVE_ACTS,
@@ -397,10 +418,12 @@ async def statute_analysis_node(state: CaseState) -> dict:
         new_only     = [c for c in statute_citations if c.source_id not in existing_ids]
 
         logger.info("[StatuteAnalysis] Returning %d new statutory citations", len(new_only))
+        await _broadcast("statute_analysis", "completed", "", f"Mapped {len(new_only)} sections")
         return {"precedents": new_only}
 
     except Exception as exc:
         logger.error("statute_analysis_node error: %s", exc, exc_info=True)
+        await _broadcast("statute_analysis", "completed", "", "Failed to map sections")
         return {}
 
 
@@ -458,6 +481,77 @@ async def opposition_formulator_node(state: CaseState) -> dict:
     except Exception as exc:
         logger.error("opposition_formulator_node error: %s", exc, exc_info=True)
         return {"opposition_case": {"hypotheses": [], "strongest_attack_vector": "unknown", "client_clarifications_needed": []}}
+
+
+OPPOSITION_ANALYSIS_PROMPT = """You are a senior Indian MACT defense advocate analyzing the OPPOSITION's case.
+
+You have the client's facts, timeline, and the FIR/charges pressed against them.
+
+Your job:
+1. Evaluate EACH charge pressed (FIR sections) — is it valid, excessive, or fabricated?
+2. Find the opposition's STRONGEST arguments (what the insurance company / other party will argue)
+3. Find the opposition's WEAK POINTS (what can be challenged)
+4. List every fact where the client hesitated, contradicted themselves, or gave unclear info — these are investigation targets for the lawyer
+5. List what critical evidence is MISSING that hurts our case
+
+Return ONLY valid JSON:
+{{
+  "charges_analysis": [
+    {{"section": "279 IPC", "description": "Rash driving", "validity": "valid|excessive|fabricated", "reasoning": "...", "challenge_strategy": "..."}}
+  ],
+  "opposition_strong_points": ["string list"],
+  "opposition_weak_points": ["string list"],  
+  "client_hesitation_flags": ["facts where client was unclear or contradicted themselves"],
+  "missing_critical_evidence": ["what evidence is absent that opposition will exploit"],
+  "investigation_targets": ["specific lawyer investigation tasks"]
+}}
+
+Facts: {facts_json}
+Timeline: {timeline_json}
+FIR/Charges: {charges_info}
+Fuzziness flags: {flags_json}
+"""
+
+async def opposition_analysis_node(state: CaseState) -> dict:
+    await _broadcast("opposition_analysis", "start", "Opposition Agent: Analyzing validity of pressed charges...")
+    
+    try:
+        llm = _pro_llm()
+        facts = state.get("facts", [])
+        flags = state.get("fuzziness_flags", [])
+        timeline = state.get("timeline", [])
+        
+        client_profile = state.get("client_profile", {})
+        charges_info = client_profile.get("charges_pressed") or client_profile.get("fir_sections") or "Unknown"
+        
+        system_prompt = inject_policy(OPPOSITION_ANALYSIS_PROMPT.format(
+            facts_json=_to_json(facts),
+            timeline_json=_to_json(timeline),
+            charges_info=charges_info,
+            flags_json=_to_json(flags),
+        ))
+
+        response = await llm.ainvoke([
+            ("system", system_prompt),
+            ("human", "Return ONLY the requested JSON."),
+        ])
+
+        try:
+            parsed = _parse_json_block(response.content)
+        except json.JSONDecodeError:
+            parsed = {}
+        
+        num_charges = len(parsed.get("charges_analysis", []))
+        num_weak_points = len(parsed.get("opposition_weak_points", []))
+        await _broadcast("opposition_analysis", "completed", "", f"Analyzed {num_charges} charges, found {num_weak_points} opposition weak points")
+        
+        await _broadcast("opposition_analysis", "completed", "", "Opposition Agent: Finished analyzing charges.")
+        return {"opposition_analysis_dict": parsed}
+
+    except Exception as exc:
+        logger.error("opposition_analysis_node error: %s", exc, exc_info=True)
+        await _broadcast("opposition_analysis", "completed", "", "Failed to analyze opposition case.")
+        return {}
 
 
 # ---------------------------------------------------------------------------
@@ -524,6 +618,7 @@ async def argument_builder_node(state: CaseState) -> dict:
     Builds client-side argument hypotheses using ONLY confirmed facts and
     citations already retrieved this run. No parametric memory citations.
     """
+    await _broadcast("argument_builder", "start", "Arguments Agent: Building compensation calculation and liability arguments...")
     try:
         llm = _pro_llm()
         facts = state.get("facts", [])
@@ -592,10 +687,12 @@ async def argument_builder_node(state: CaseState) -> dict:
             except Exception as parse_err:
                 logger.warning("Could not parse argument hypothesis: %s", parse_err)
 
+        await _broadcast("argument_builder", "completed", "", f"Built {len(arguments)} arguments")
         return {"arguments": arguments}
 
     except Exception as exc:
         logger.error("argument_builder_node error: %s", exc, exc_info=True)
+        await _broadcast("argument_builder", "completed", "", "Failed to build arguments")
         return {"arguments": []}
 
 
@@ -611,6 +708,7 @@ async def readiness_analysis_node(state: CaseState) -> dict:
     Factor-level readiness assessment only. No win probability, ever.
     Validated by checking LLM output for forbidden field names.
     """
+    await _broadcast("readiness_analysis", "start", "Readiness Agent: Scoring case completeness...")
     try:
         llm = _flash_llm()
         facts = state.get("facts", [])
@@ -678,10 +776,12 @@ async def readiness_analysis_node(state: CaseState) -> dict:
             ),
         )
 
+        await _broadcast("readiness_analysis", "completed", "", "Scored case completeness")
         return {"readiness_signals": signals}
 
     except Exception as exc:
         logger.error("readiness_analysis_node error: %s", exc, exc_info=True)
+        await _broadcast("readiness_analysis", "completed", "", "Failed to score case completeness")
         return {}
 
 
@@ -692,52 +792,87 @@ async def readiness_analysis_node(state: CaseState) -> dict:
 async def packet_compiler_node(state: CaseState) -> dict:
     """
     Assembles the full lawyer packet: Markdown, JSON, and WhatsApp summary.
-    No win probability anywhere.
+    Includes win probability computed via PRO model.
     """
+    await _broadcast("packet_compiler", "start", "Packet Compiler: Drafting final lawyer case packet...")
     try:
-        llm = _flash_llm()
+        llm = _pro_llm()
 
         facts = state.get("facts", [])
         timeline = state.get("timeline", [])
-        entity_graph = state.get("entity_graph", {})
         documents = state.get("documents", [])
         flags = state.get("fuzziness_flags", [])
         precedents = state.get("precedents", [])
         opposition = state.get("opposition_case", {})
-        witnesses = state.get("witness_candidates", [])
+        opposition_analysis = state.get("opposition_analysis_dict", {})
+        
+        # Merge them safely
+        combined_opposition = {**opposition, **opposition_analysis}
+        
         arguments = state.get("arguments", [])
         readiness = state.get("readiness_signals")
-        lawyer_name = state.get("lawyer_name", "Vakeel Sahab")
+        client_profile = state.get("client_profile", {})
 
-        system_prompt = inject_policy(PACKET_COMPILER_PROMPT.format(
-            facts_json=_to_json(facts),
-            timeline_json=_to_json(timeline),
-            entity_graph_json=json.dumps(entity_graph, ensure_ascii=False),
-            documents_json=_to_json(documents),
-            fuzziness_flags=_to_json(flags),
-            precedents_json=_to_json(precedents),
-            opposition_case_json=json.dumps(opposition, ensure_ascii=False),
-            witness_candidates_json=_to_json(witnesses),
-            arguments_json=_to_json(arguments),
-            readiness_signals_json=_to_json(readiness) if readiness else "{}",
-            lawyer_name=lawyer_name,
-        ))
+        unresolved_flags = [f for f in flags if getattr(f, "resolved", False) == False]
+        statutes = [p for p in precedents if getattr(p, "applicability_status", "") == "statute"]
+        case_laws = [p for p in precedents if getattr(p, "applicability_status", "") != "statute"]
+
+        system_prompt = inject_policy(f"""You are compiling a final case packet for an Indian MACT advocate.
+You must construct the output as a valid JSON with the EXACT structure below. Do not deviate.
+
+Required keys:
+1. "markdown": A comprehensive markdown report of the case.
+2. "whatsapp_summary": A max 500-word Hinglish summary.
+3. "packet_json": Must have the exact 7 keys detailed below.
+
+packet_json structure:
+{{
+  "initial_details": {{
+    "incident_narrative": "write a clear summary of the incident",
+    "chronological_timeline": [], // use provided timeline
+    "client_profile": {{}}, // use provided client profile
+    "victim_profile": {{}} // extract from facts where field starts with "victim_"
+  }},
+  "opposition_case": {{}}, // use provided opposition case
+  "precedents": [], // use provided case laws
+  "fuzziness_and_gaps": [], // use provided unresolved flags
+  "law_sections": [], // use provided statutes
+  "our_arguments": [], // use provided arguments
+  "win_probability": {{
+    "score": 0.0-1.0,
+    "label": "Strong|Moderate|Weak|Unknown",
+    "reasoning": "compute this based on evidence_completeness, precedent_alignment, and open_fuzziness_load",
+    "caveat": "This is a preliminary AI assessment, not legal advice"
+  }}
+}}
+
+Data:
+Timeline: {_to_json(timeline)}
+Client Profile: {_to_json(client_profile)}
+Facts: {_to_json(facts)}
+Opposition: {_to_json(combined_opposition)}
+Case Laws: {_to_json(case_laws)}
+Statutes: {_to_json(statutes)}
+Unresolved Flags: {_to_json(unresolved_flags)}
+Arguments: {_to_json(arguments)}
+Readiness Signals: {_to_json(readiness) if readiness else 'None'}
+""")
 
         response = await llm.ainvoke([
             ("system", system_prompt),
-            ("human", "Compile the complete lawyer packet. Return JSON with keys: markdown (str), packet_json (dict), whatsapp_summary (str, max 500 words in Hinglish)."),
+            ("human", "Return ONLY the requested JSON."),
         ])
 
         try:
             parsed = _parse_json_block(response.content)
         except json.JSONDecodeError:
-            # Fallback: use raw response as markdown
             parsed = {
                 "markdown": response.content,
                 "packet_json": {},
                 "whatsapp_summary": "Packet compiled. Please review the full brief.",
             }
 
+        await _broadcast("packet_compiler", "completed", "", "Compiled case packet")
         return {
             "lawyer_packet_markdown": parsed.get("markdown", ""),
             "lawyer_packet_json": parsed.get("packet_json", {}),
@@ -745,6 +880,7 @@ async def packet_compiler_node(state: CaseState) -> dict:
 
     except Exception as exc:
         logger.error("packet_compiler_node error: %s", exc, exc_info=True)
+        await _broadcast("packet_compiler", "completed", "", "Failed to compile packet")
         return {
             "lawyer_packet_markdown": "# Error\nPacket compilation failed. Please retry.",
             "lawyer_packet_json": {},
