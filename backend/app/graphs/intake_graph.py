@@ -11,7 +11,7 @@ from app.agents.intake_agents import (
     document_request_node,
     confirmation_flow_node,
 )
-from app.legal_data.property_dispute_schema import get_missing_fields
+from NyayaLens.backend.app.legal_data.Motor_accident_schema import get_missing_fields
 
 
 def should_continue_intake(state: CaseState) -> str:
