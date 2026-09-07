@@ -22,8 +22,17 @@ const config: Config = {
       },
       fontFamily: {
         sans: ["Inter", "system-ui", "sans-serif"],
-        mono: ["JetBrains Mono", "monospace"],
+        mono: ["Space Mono", "JetBrains Mono", "monospace"],
       },
+      keyframes: {
+        fadeIn: {
+          from: { opacity: '0', transform: 'translateY(4px)' },
+          to: { opacity: '1', transform: 'none' }
+        }
+      },
+      animation: {
+        'fadeIn': 'fadeIn 0.3s ease'
+      }
     },
   },
   plugins: [],
