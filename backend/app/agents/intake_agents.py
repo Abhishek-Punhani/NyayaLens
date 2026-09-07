@@ -18,7 +18,7 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from langgraph.types import interrupt
 
 from app.config import GOOGLE_API_KEY, MODEL_FLASH
-from NyayaLens.backend.app.legal_data.Motor_accident_schema import get_missing_fields, get_next_priority_field
+from app.legal_data.Motor_accident_schema import get_missing_fields, get_next_priority_field
 from app.legal_data.section_mapping import get_applicable_law
 from app.prompts.global_policy import inject_policy
 from app.prompts.analysis_prompts import CONFIRMATION_FLOW_PROMPTS
@@ -115,13 +115,18 @@ async def case_type_router_node(state: CaseState) -> dict:
         case_type = result.get("case_type", "motor_accident")
         subtype = result.get("accident_subtype", "not_applicable")
 
+        if case_type == "unknown":
+            return {
+                "case_type": "unknown",
+                "accident_subtype": "not_applicable",
+                "law_version_context": "unknown",
+                "intake_phase": "human_handoff",
+            }
         # Determine applicable law/article context from the accident sub-type
-        law_ctx = get_applicable_law(subtype)
-
         return {
             "case_type": case_type,
             "accident_subtype": subtype,
-            "law_version_context": law_ctx,
+            "law_version_context": "unknown",   # resolved later
             "intake_phase": "cross_question",
         }
 
@@ -211,6 +216,7 @@ async def cross_question_node(state: CaseState) -> dict:
                 confidence=candidate.get("confidence", 0.7),
                 status="unconfirmed",
                 contradicts=[],
+                epistemic_status=candidate.get("epistemic_status"),   # ← add
             ))
 
         # Also write the raw client answer as a fact
@@ -227,8 +233,15 @@ async def cross_question_node(state: CaseState) -> dict:
                 contradicts=[],
             ))
 
+        accident_date_fact = next((f for f in new_facts if f.field == "accident_datetime"), None)
+        law_ctx_update = {}
+        if accident_date_fact:
+            law_ctx_update["law_version_context"] = get_applicable_law(accident_date_fact.value)
+
+
         return {
             "facts": new_facts,
+            **law_ctx_update,
             "messages": [
                 AIMessage(content=spoken_response),
                 HumanMessage(content=client_answer),
@@ -360,6 +373,7 @@ async def entity_tracker_node(state: CaseState) -> dict:
                     confidence=rf.get("confidence", 0.5),
                     status="unconfirmed",
                     contradicts=rf.get("contradicts", []),
+                    epistemic_status=rf.get("epistemic_status")
                 ))
             except Exception:
                 pass
@@ -421,9 +435,7 @@ async def document_request_node(state: CaseState) -> dict:
         for req in doc_requests:
             doc_id = f"DOC-{uuid.uuid4().hex[:8]}"
             doc_type_lower = req.get("document_type", "").lower()
-            is_recording = req.get("material_or_optional", "material") == "material" and any(
-                kw in doc_type_lower for kw in RECORDING_KEYWORDS
-            )
+            is_recording = any(kw in doc_type_lower for kw in RECORDING_KEYWORDS)
             doc = DocumentRecord(
                 doc_id=doc_id,
                 doc_type=req.get("document_type", "unknown"),

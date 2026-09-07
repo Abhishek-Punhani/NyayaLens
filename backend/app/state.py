@@ -15,6 +15,7 @@ class Fact(BaseModel):
     confidence: float        # 0.0–1.0
     status: Literal["unconfirmed", "confirmed", "superseded"]
     contradicts: list[str]   # fact_ids this contradicts
+    epistemic_status: Optional[Literal["direct", "hearsay", "inferred"]] = None  # ← add
 
 class CitationRecord(BaseModel):
     source_id: str
@@ -54,9 +55,9 @@ class ConsentRecord(BaseModel):
 class FuzzinessFlag(BaseModel):
     flag_id: str
     flag_type: Literal[
-        "DIRECT_CONTRADICTION", "TIMELINE_CONFLICT", "ROLE_AMBIGUITY",
-        "SOURCE_CONFLICT", "VAGUE_ACCOUNT", "MISSING_EXPECTED_DOCUMENT",
-        "JURISDICTION_OR_DATE_UNCLEAR", "UNCORROBORATED_ASSERTION"
+        "contradiction", "timeline_conflict", "vague_account",
+        "missing_document", "liability_ambiguity",
+        "jurisdiction_ambiguity", "witness_or_evidence_gap"
     ]
     severity: Literal["low", "medium", "high"]
     fact_refs: list[str]
@@ -94,7 +95,7 @@ class CaseState(TypedDict):
     case_type: Literal["property_dispute", "motor_accident", "criminal_fir"]
     law_version_context: Literal["pre_2024_codes", "post_2024_codes", "mixed", "unknown"]
     dispossession_track: Literal["section_6", "title_suit", "unclear", "not_determined"]
-    intake_phase: Literal["open_narrative", "cross_question", "document_request", "confirmation", "complete"]
+    intake_phase: Literal["open_narrative", "cross_question", "document_request", "confirmation", "complete", "human_handoff"]
     messages: Annotated[list, add_messages]   # full conversation history
     facts: Annotated[list[Fact], operator.add]
     documents: list[DocumentRecord]
@@ -112,3 +113,5 @@ class CaseState(TypedDict):
     readiness_signals: Optional[ReadinessSignals]
     lawyer_packet_markdown: Optional[str]
     lawyer_packet_json: Optional[dict]
+    accident_subtype: Optional[str]   # ← add this line
+
