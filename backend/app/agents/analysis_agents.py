@@ -97,12 +97,27 @@ def _to_json(obj: Any) -> str:
     return json.dumps(obj, ensure_ascii=False, indent=2)
 
 
-def _parse_json_block(text: str) -> Any:
+def _parse_json_block(text: Any) -> Any:
+    if isinstance(text, list):
+        parts = []
+        for part in text:
+            if isinstance(part, str):
+                parts.append(part)
+            elif isinstance(part, dict) and "text" in part:
+                parts.append(part["text"])
+            elif hasattr(part, "text"):
+                parts.append(getattr(part, "text", ""))
+            else:
+                parts.append(str(part))
+        text = "".join(parts)
+    elif not isinstance(text, str):
+        text = str(text)
+
     text = text.strip()
     if text.startswith("```"):
         lines = text.split("\n")
         text = "\n".join(lines[1:-1]) if lines[-1].strip() == "```" else "\n".join(lines[1:])
-    return json.loads(text)
+    return json.loads(text.strip())
 
 
 def _validate_citation(raw: dict) -> CitationRecord | None:
