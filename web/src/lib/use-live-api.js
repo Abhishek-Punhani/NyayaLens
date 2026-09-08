@@ -57,7 +57,7 @@ export function useLiveAPI(options) {
 
   const defaultModel =
     (typeof process !== "undefined" && process.env.NEXT_PUBLIC_GEMINI_LIVE_MODEL) ||
-    "models/gemini-3.1-flash-live-preview";
+    "models/gemini-2.0-flash-exp";
   const [model, setModel]   = useState(defaultModel);
   const [config, setConfig] = useState({});
   const [connected, setConnected] = useState(false);

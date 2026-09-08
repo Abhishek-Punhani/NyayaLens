@@ -22,14 +22,8 @@ from app.legal_data.Motor_accident_schema import get_missing_fields, get_missing
 from app.legal_data.section_mapping import get_applicable_law
 from app.prompts.global_policy import inject_policy
 from app.prompts.analysis_prompts import CONFIRMATION_FLOW_PROMPTS
-from app.prompts.intake_prompts import (
-    CASE_TYPE_ROUTER_PROMPT,
-    CROSS_QUESTION_PROMPT,
-    DOCUMENT_REQUEST_PROMPT,
-    FACT_EXTRACTION_PROMPT,
-    FUZZINESS_DETECTOR_PROMPT,
-    CONSENT_INTENT_PROMPT,
-)
+from app.prompts.loader import render_prompt
+from app.schemas.llm_schemas import CaseTypeOutput, CrossQuestionOutput, EntityTrackerOutput, FuzzinessOutput, DocumentRequestOutput, ConsentIntentOutput
 from app.state import (
     CaseState,
     ConsentRecord,
@@ -61,16 +55,6 @@ def _flags_to_json(flags: list[FuzzinessFlag]) -> str:
     return json.dumps([f.model_dump() for f in flags], ensure_ascii=False, indent=2)
 
 
-def _parse_json_block(text: str) -> Any:
-    """Extract JSON from LLM output that may be wrapped in markdown code fences."""
-    text = text.strip()
-    if text.startswith("```"):
-        lines = text.split("\n")
-        # Strip opening and closing fence lines
-        text = "\n".join(lines[1:-1]) if lines[-1].strip() == "```" else "\n".join(lines[1:])
-    return json.loads(text)
-
-
 # ---------------------------------------------------------------------------
 # Node 1 — Case-Type Router
 # ---------------------------------------------------------------------------
@@ -87,7 +71,7 @@ async def case_type_router_node(state: CaseState) -> dict:
         language = state.get("language", "hi")
 
         llm = _flash_llm()
-        system_prompt = inject_policy(CASE_TYPE_ROUTER_PROMPT.format(language=language))
+        system_prompt = render_prompt("case_type_router.yaml", {"language": language})
 
         # Build a lightweight conversation so the LLM has context
         conversation = [("system", system_prompt)]
@@ -97,7 +81,7 @@ async def case_type_router_node(state: CaseState) -> dict:
             elif isinstance(msg, AIMessage):
                 conversation.append(("ai", msg.content))
 
-        # Ask the router to classify and produce a JSON result
+     # Ask the router to classify and produce a JSON result
         conversation.append((
             "human",
             "Based on the conversation so far, return JSON with keys: "
@@ -109,11 +93,14 @@ async def case_type_router_node(state: CaseState) -> dict:
             "reason (one sentence). Only JSON, no markdown."
         ))
 
-        response = await llm.ainvoke(conversation)
-        result = _parse_json_block(response.content)
-
-        case_type = result.get("case_type", "motor_accident")
-        subtype = result.get("accident_subtype", "not_applicable")
+        try:
+            response = await llm.with_structured_output(CaseTypeOutput).ainvoke(conversation)
+            case_type = response.case_type
+            subtype = response.accident_subtype
+        except Exception as e:
+            logger.error(f"Error in case_type_router: {e}")
+            case_type = "unknown"
+            subtype = "not_applicable"
 
         if case_type == "unknown":
             return {
@@ -187,15 +174,15 @@ async def cross_question_node(state: CaseState) -> dict:
         missing_by_phase = get_missing_fields_by_phase(facts)
         unresolved_flags = [f for f in fuzziness_flags if not f.resolved]
 
-        system_prompt = inject_policy(CROSS_QUESTION_PROMPT.format(
-            language=language,
-            interview_stage=current_stage,
-            facts_json=_facts_to_json(facts),
-            accident_subtype=subtype,
-            missing_fields=json.dumps(missing_by_phase),
-            fuzziness_flags=_flags_to_json(unresolved_flags),
-            client_profile_json=json.dumps(client_profile, ensure_ascii=False, indent=2),
-        ))
+        system_prompt = render_prompt("cross_question.yaml", {
+            "language": language,
+            "interview_stage": current_stage,
+            "facts_json": _facts_to_json(facts),
+            "accident_subtype": subtype,
+            "missing_fields": json.dumps(missing_by_phase),
+            "fuzziness_flags": _flags_to_json(unresolved_flags),
+            "client_profile_json": json.dumps(client_profile, ensure_ascii=False, indent=2)
+        })
 
         # Build the conversation with full context (last 10 turns)
         messages = state.get("messages", [])
@@ -210,15 +197,15 @@ async def cross_question_node(state: CaseState) -> dict:
         if len(conversation) == 1:
             conversation.append(("human", "Namaskar, mujhe apni baat batani hai."))
 
-        response = await llm.ainvoke(conversation)
-
         try:
-            parsed = _parse_json_block(response.content)
-        except json.JSONDecodeError:
+            response = await llm.with_structured_output(CrossQuestionOutput).ainvoke(conversation)
+            parsed = response.model_dump()
+        except Exception as e:
+            logger.error(f"Error in cross_question_node: {e}")
             parsed = {
-                "spoken_response": response.content,
-                "next_question": response.content,
-                "reason": "llm_free_text",
+                "spoken_response": "I am having trouble understanding. Please repeat.",
+                "next_question": "Can you please repeat that?",
+                "reason": "fallback",
                 "interview_stage_after": current_stage,
                 "updated_fact_candidates": [],
                 "client_profile_update": {},
@@ -321,18 +308,16 @@ async def fuzziness_detector_node(state: CaseState) -> dict:
         if not facts:
             return {"fuzziness_flags": []}
 
-        system_prompt = inject_policy(FUZZINESS_DETECTOR_PROMPT.format(
-            facts_json=_facts_to_json(facts),
-            timeline_json=json.dumps(timeline, ensure_ascii=False),
-        ))
-
-        response = await llm.ainvoke([("system", system_prompt)])
+        system_prompt = render_prompt("fuzziness_detector.yaml", {
+            "facts_json": _facts_to_json(facts),
+            "timeline_json": json.dumps(timeline, ensure_ascii=False)
+        })
 
         try:
-            raw_flags = _parse_json_block(response.content)
-            if not isinstance(raw_flags, list):
-                raw_flags = raw_flags.get("flags", [])
-        except (json.JSONDecodeError, AttributeError):
+            response = await llm.with_structured_output(FuzzinessOutput).ainvoke([("system", system_prompt)])
+            raw_flags = response.model_dump().get("flags", [])
+        except Exception as e:
+            logger.error(f"Error in fuzziness_detector_node: {e}")
             return {"fuzziness_flags": []}
 
         # Validate and convert to FuzzinessFlag objects
@@ -390,20 +375,20 @@ async def entity_tracker_node(state: CaseState) -> dict:
                 transcript_lines.append(f"NYAYA: {msg.content}")
         transcript = "\n".join(transcript_lines)
 
-        system_prompt = inject_policy(FACT_EXTRACTION_PROMPT.format(
-            transcript=transcript,
-            existing_facts=_facts_to_json(facts),
-            existing_client_profile=json.dumps(client_profile, ensure_ascii=False),
-        ))
-
-        response = await llm.ainvoke([
-            ("system", system_prompt),
-            ("human", "Extract entities, timeline, new_facts, and client_profile_update. Return JSON."),
-        ])
+        system_prompt = render_prompt("fact_extraction.yaml", {
+            "transcript": transcript,
+            "existing_facts": _facts_to_json(facts),
+            "existing_client_profile": json.dumps(client_profile, ensure_ascii=False)
+        })
 
         try:
-            parsed = _parse_json_block(response.content)
-        except json.JSONDecodeError:
+            response = await llm.with_structured_output(EntityTrackerOutput).ainvoke([
+                ("system", system_prompt),
+                ("human", "Extract entities, timeline, new_facts, and client_profile_update. Return structured output.")
+            ])
+            parsed = response.model_dump()
+        except Exception as e:
+            logger.error(f"Error in entity_tracker_node: {e}")
             return {}
 
         entity_graph = parsed.get("entity_graph", state.get("entity_graph", {"nodes": [], "edges": []}))
@@ -471,20 +456,18 @@ async def document_request_node(state: CaseState) -> dict:
         fuzziness_flags = state.get("fuzziness_flags", [])
         lawyer_name = state.get("lawyer_name") or "Vakeel Sahab"
 
-        system_prompt = inject_policy(DOCUMENT_REQUEST_PROMPT.format(
-            language=language,
-            facts_json=_facts_to_json(facts),
-            fuzziness_flags=_flags_to_json(fuzziness_flags),
-            lawyer_name=lawyer_name,
-        ))
-
-        response = await llm.ainvoke([("system", system_prompt)])
+        system_prompt = render_prompt("document_request.yaml", {
+            "language": language,
+            "facts_json": _facts_to_json(facts),
+            "fuzziness_flags": _flags_to_json(fuzziness_flags),
+            "lawyer_name": lawyer_name
+        })
 
         try:
-            doc_requests = _parse_json_block(response.content)
-            if not isinstance(doc_requests, list):
-                doc_requests = doc_requests.get("requests", [])
-        except json.JSONDecodeError:
+            response = await llm.with_structured_output(DocumentRequestOutput).ainvoke([("system", system_prompt)])
+            doc_requests = response.model_dump().get("documents", [])
+        except Exception as e:
+            logger.error(f"Error in document_request_node: {e}")
             doc_requests = []
 
         # Build DocumentRecord objects for each requested document
@@ -550,16 +533,13 @@ async def _judge_consent(llm, question_asked: str, answer: str) -> tuple[str, st
     Returns (verdict, reason).
     """
     try:
-        prompt = CONSENT_INTENT_PROMPT.format(
-            question_asked=question_asked,
-            client_reply=answer,
-        )
-        response = await llm.ainvoke([("system", prompt)])
-        parsed = _parse_json_block(response.content)
-        verdict = parsed.get("verdict", "ambiguous")
-        reason = parsed.get("reason", "")
-        if verdict not in ("yes", "no", "ambiguous"):
-            verdict = "ambiguous"
+        prompt = render_prompt("consent_intent.yaml", {
+            "question_asked": question_asked,
+            "client_reply": answer
+        })
+        response = await llm.with_structured_output(ConsentIntentOutput).ainvoke([("system", prompt)])
+        verdict = response.verdict if response.verdict in ("yes", "no", "ambiguous") else "ambiguous"
+        reason = response.reason
         return verdict, reason
     except Exception as exc:
         logger.warning("Consent LLM classification failed, treating as ambiguous: %s", exc)
