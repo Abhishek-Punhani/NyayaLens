@@ -31,8 +31,8 @@ if not INDIAN_KANOON_TOKEN:
 # ---------------------------------------------------------------------------
 MODEL_VOICE  = os.getenv("MODEL_VOICE",  "gemini-3.1-flash-live-preview")   # Realtime audio dialog
 MODEL_PRO    = os.getenv("MODEL_PRO",    "gemini-3.1-pro-preview")          # Deep legal reasoning
-MODEL_FLASH  = os.getenv("MODEL_FLASH",  "gemini-3.7-flash")                # Fast extraction agents
-MODEL_SEARCH = os.getenv("MODEL_SEARCH", "gemini-2.5-flash")                # Keyword generation & search queries
+MODEL_FLASH  = os.getenv("MODEL_FLASH",  "gemini-3.6-flash")                # Fast extraction agents
+MODEL_SEARCH = os.getenv("MODEL_SEARCH", "gemini-3.6-flash")                # Keyword generation & search queries
 
 # ---------------------------------------------------------------------------
 # Storage & Paths

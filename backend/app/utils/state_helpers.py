@@ -69,9 +69,14 @@ def get_document_facts(facts: list[Fact]) -> list[Fact]:
     return [f for f in facts if f.evidence_type == "DOCUMENT_EXTRACTED"]
 
 
-def schema_completeness(facts: list[Fact]) -> float:
+def schema_completeness(facts: list[Fact], client_profile: Optional[dict] = None) -> float:
     """Fraction of motor accident schema fields that have been collected."""
     from app.legal_data.Motor_accident_schema import MOTOR_ACCIDENT_FIELDS
     schema_fields = {f["field_name"] for f in MOTOR_ACCIDENT_FIELDS}
     filled = {f.field for f in facts} & schema_fields
+    if client_profile:
+        for k, v in client_profile.items():
+            if v is not None and v != "" and v != [] and v != {} and k in schema_fields:
+                filled.add(k)
     return len(filled) / max(len(schema_fields), 1)
+

@@ -211,32 +211,35 @@ def _initial_state(
 # ---------------------------------------------------------------------------
 
 async def _handle_start_intake(session_id: str, args: dict) -> dict:
-    """Initialise the intake graph for this session and return the opening disclosure."""
+    """
+    Initialise the intake graph for this session.
+    Just seeds the LangGraph checkpoint state — does NOT run any LLM.
+    Gemini Live's Phase 1 system prompt handles the opening question.
+    """
     initial = _initial_state(
         thread_id=session_id,
         language=active_sessions.get(session_id, {}).get("language", "hi"),
         lawyer_name=active_sessions.get(session_id, {}).get("lawyer_name"),
         lawyer_contact=active_sessions.get(session_id, {}).get("lawyer_contact"),
     )
-    # Kick off graph with the opening disclosure message
-    opening = HumanMessage(content="Namaskar. Main apni baat aapse share karna chahta hoon.")
+    # Seed with a neutral "client is ready" message — does NOT contain any greeting
+    # so the LLM will ask the first meaningful question
+    opening = HumanMessage(content="[Client has given consent. Start the interview.]")
     initial["messages"] = [opening]
 
-    await intake_graph.ainvoke(initial, config=_graph_config(session_id))
-    
-    # Graph is now paused at the first interrupt() in cross_question_node
-    snapshot = intake_graph.get_state(_graph_config(session_id))
-    interrupt_value = snapshot.tasks[0].interrupts[0].value if snapshot.tasks and snapshot.tasks[0].interrupts else {}
-    
+    try:
+        await intake_graph.ainvoke(initial, config=_graph_config(session_id))
+    except Exception as exc:
+        logger.warning("Graph init warning: %s", exc)
+
     await broadcast(session_id, {"event": "intake_started", "session_id": session_id})
 
-    # The backend LLM generates the engage phase question
-    spoken_response = interrupt_value.get("spoken_response", "Namaskar. Pehle main aapko bata doon ki aap yahaan safe hain. Apni poori baat batayein.")
-
+    # Return empty — Gemini Live uses Phase 1 from its own system prompt
     return {
         "status": "started",
-        "spoken_response": spoken_response,
+        "spoken_response": "",
     }
+
 
 
 async def _handle_submit_client_response(session_id: str, args: dict) -> dict:
@@ -277,7 +280,7 @@ async def _handle_submit_client_response(session_id: str, args: dict) -> dict:
     })
 
     # The backend LLM generates the exact spoken response we want the Voice Agent to say.
-    spoken_response = interrupt_value.get("spoken_response", "Acha, aage batayein.")
+    spoken_response = interrupt_value.get("spoken_response") or interrupt_value.get("next_question", "")
 
     return {
         "status": "recorded",
@@ -476,7 +479,25 @@ async def handle_tool_call(request: ToolCallRequest, background_tasks: Backgroun
     args = request.arguments
 
     if session_id not in active_sessions:
-        raise HTTPException(status_code=404, detail=f"Session {session_id} not found")
+        current_state = _get_current_state(session_id)
+        if current_state is not None:
+            active_sessions[session_id] = {
+                "language": current_state.get("language", "hi"),
+                "lawyer_name": current_state.get("lawyer_name"),
+                "lawyer_contact": current_state.get("lawyer_contact"),
+                "status": "INTAKE",
+            }
+            logger.info("Re-hydrated session %s from LangGraph checkpoint in tool call", session_id)
+        else:
+            # Auto-register session so start_intake and tool calls NEVER fail with 404 after server restarts!
+            active_sessions[session_id] = {
+                "language": "hi",
+                "lawyer_name": "",
+                "lawyer_contact": "",
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "status": "INTAKE",
+            }
+            logger.info("Auto-registered new session %s in tool call", session_id)
 
     logger.info("Tool call: session=%s tool=%s", session_id, tool_name)
 
@@ -598,19 +619,117 @@ async def upload_document(
 
 @app.get("/api/session/{thread_id}")
 async def get_session(thread_id: str):
-    """Return full current state for the judge-facing observability dashboard."""
-    if thread_id not in active_sessions:
-        raise HTTPException(status_code=404, detail="Session not found")
-
+    """Return full current state for the lawyer dashboard — works even after backend restart."""
+    # Try to get LangGraph state first (works even without active_sessions)
     current = _get_current_state(thread_id)
+    
+    # If not in active_sessions, re-hydrate from LangGraph checkpoint if possible
+    if thread_id not in active_sessions and current is not None:
+        active_sessions[thread_id] = {
+            "language": current.get("language", "hi"),
+            "lawyer_name": current.get("lawyer_name"),
+            "lawyer_contact": current.get("lawyer_contact"),
+            "status": "INTAKE",
+        }
+        logger.info("Re-hydrated session %s from LangGraph checkpoint", thread_id)
+
+    if thread_id not in active_sessions:
+        active_sessions[thread_id] = {
+            "language": current.get("language", "hi") if current else "hi",
+            "lawyer_name": current.get("lawyer_name") if current else "",
+            "lawyer_contact": current.get("lawyer_contact") if current else "",
+            "status": "INTAKE",
+        }
+
     if current is None:
-        return {"thread_id": thread_id, "status": "initializing", "state": {}}
+        initial = _initial_state(thread_id, "hi", "", "")
+        return {"thread_id": thread_id, "status": "INTAKE", "state": _serialize_state(initial)}
 
     return {
         "thread_id": thread_id,
         "status": active_sessions[thread_id].get("status", "INTAKE"),
         "state": _serialize_state(current),
     }
+
+
+def _generate_call_summary(thread_id: str, state: Optional[CaseState]) -> dict:
+    """Generate or format a 2-3 sentence executive call summary."""
+    if not state:
+        return {
+            "session_id": thread_id,
+            "summary": "Call initiated. Waiting for client statement.",
+            "facts_count": 0,
+            "flags_count": 0,
+            "interview_stage": "engage",
+        }
+
+    facts = state.get("facts") or []
+    flags = state.get("fuzziness_flags") or []
+    stage = state.get("interview_stage") or "engage"
+
+    if not facts:
+        return {
+            "session_id": thread_id,
+            "summary": "Call initiated. Waiting for client statement.",
+            "facts_count": 0,
+            "flags_count": 0,
+            "interview_stage": "engage",
+        }
+
+    # Accident sub-type or topic
+    subtype = state.get("accident_subtype")
+    if not subtype or subtype == "not_applicable":
+        case_type = state.get("case_type", "motor_accident")
+        topic = case_type.replace("_", " ").title()
+    else:
+        topic = subtype.replace("_", " ").title()
+
+    stage_display = stage.replace("_", " ")
+
+    sentence_1 = f"Client intake is currently in the {stage_display} stage focusing on a {topic} matter."
+    sentence_2 = f"A total of {len(facts)} key fact{'s have' if len(facts) != 1 else ' has'} been captured and recorded from the client interview."
+
+    # Critical open flags check
+    unresolved_flags = []
+    for f in flags:
+        is_resolved = getattr(f, "resolved", False) if hasattr(f, "resolved") else (f.get("resolved", False) if isinstance(f, dict) else False)
+        if not is_resolved:
+            unresolved_flags.append(f)
+
+    critical_types = []
+    for f in unresolved_flags:
+        ftype = getattr(f, "flag_type", None) if hasattr(f, "flag_type") else (f.get("flag_type") if isinstance(f, dict) else None)
+        sev = getattr(f, "severity", None) if hasattr(f, "severity") else (f.get("severity") if isinstance(f, dict) else None)
+        if ftype and (sev == "high" or ftype in ("limitation_risk", "contradiction", "timeline_conflict", "liability_ambiguity")):
+            critical_types.append(ftype.replace("_", " "))
+
+    if critical_types:
+        unique_crits = sorted(list(set(critical_types)))
+        sentence_3 = f"Critical open flags identified for counsel review include: {', '.join(unique_crits)}."
+    elif unresolved_flags:
+        sentence_3 = f"There {'are' if len(unresolved_flags) != 1 else 'is'} {len(unresolved_flags)} active evidentiary flag{'s' if len(unresolved_flags) != 1 else ''} noted for clarification."
+    else:
+        sentence_3 = "No critical evidentiary contradictions or limitation risks have been identified at this time."
+
+    summary_text = f"{sentence_1} {sentence_2} {sentence_3}"
+
+    return {
+        "session_id": thread_id,
+        "summary": summary_text,
+        "facts_count": len(facts),
+        "flags_count": len(flags),
+        "interview_stage": stage,
+    }
+
+
+@app.get("/api/session/{thread_id}/call-summary")
+async def get_call_summary(thread_id: str):
+    """Return an executive call summary — works even after backend restart."""
+    # Try LangGraph directly — no active_sessions check needed
+    current = _get_current_state(thread_id)
+    if current is None and thread_id not in active_sessions:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return _generate_call_summary(thread_id, current)
 
 
 @app.get("/api/session/{thread_id}/packet")
@@ -631,18 +750,47 @@ async def get_packet(thread_id: str):
     }
 
 
+@app.delete("/api/session/{thread_id}")
+async def delete_session(thread_id: str):
+    """Delete an active session from memory and cancel ongoing tasks."""
+    # Cancel running analysis task if any
+    task = analysis_tasks.pop(thread_id, None)
+    if task and not task.done():
+        task.cancel()
+
+    # Close any open WebSockets
+    connections = ws_connections.pop(thread_id, [])
+    for ws in connections:
+        try:
+            await ws.close()
+        except Exception:
+            pass
+
+    # Clean up SSE subscribers
+    sse_subscribers.pop(thread_id, None)
+
+    # Remove from active_sessions
+    active_sessions.pop(thread_id, None)
+
+    return {"status": "deleted", "session_id": thread_id}
+
+
 @app.post("/api/session/{thread_id}/accept-case")
 async def accept_case(thread_id: str, background_tasks: BackgroundTasks):
     """Called by lawyer when they accept a case. Triggers deep analysis pipeline."""
-    if thread_id not in active_sessions:
-        raise HTTPException(status_code=404, detail="Session not found")
-    
-    active_sessions[thread_id]["status"] = "ANALYSIS"
-    await broadcast(thread_id, {"event": "analysis_started", "session_id": thread_id})
-    
     current = _get_current_state(thread_id)
+    if thread_id not in active_sessions:
+        active_sessions[thread_id] = {
+            "language": current.get("language", "hi") if current else "hi",
+            "lawyer_name": current.get("lawyer_name") if current else "",
+            "lawyer_contact": current.get("lawyer_contact") if current else "",
+            "status": "ANALYSIS",
+        }
+    else:
+        active_sessions[thread_id]["status"] = "ANALYSIS"
+
     if current is None:
-        raise HTTPException(status_code=404, detail="Session state not found")
+        current = _initial_state(thread_id, "hi", "", "")
 
     async def _run_deep_analysis():
         try:
@@ -653,7 +801,30 @@ async def accept_case(thread_id: str, background_tasks: BackgroundTasks):
                 "id": str(uuid.uuid4()),
                 "content": {"stage": "pipeline_init", "message": "Deep analysis pipeline initializing..."}
             })
-            await analysis_graph.ainvoke(current, config=_graph_config(thread_id))
+            
+            node_messages = {
+                'precedent_research': 'Researching SC/HC judgments and MACT precedents...',
+                'statute_analysis': 'Analyzing Motor Vehicles Act §166/168 and BSA provisions...',
+                'witness_candidate': 'Identifying potential witnesses from the case facts...',
+                'opposition_analysis': 'Anticipating insurance company defenses...',
+                'opposition_formulator': 'Formulating counter-arguments to insurer defenses...',
+                'argument_builder': 'Building legal arguments and pleadings framework...',
+                'readiness_analysis': 'Evaluating case readiness for MACT filing...',
+                'packet_compiler': 'Compiling final lawyer brief and case packet...',
+            }
+            
+            # Use astream to emit real-time thinking events from LangGraph
+            async for event in analysis_graph.astream(current, config=_graph_config(thread_id), stream_mode="updates"):
+                for node_name, node_state in event.items():
+                    msg = node_messages.get(node_name, f"Running {node_name}...")
+                    await broadcast(thread_id, {
+                        "event": "sse_event",
+                        "kind": "reasoning",
+                        "status": "running",
+                        "id": str(uuid.uuid4()),
+                        "content": {"agent": node_name, "message": msg}
+                    })
+
             final = _get_current_state(thread_id)
             if final and final.get("readiness_signals"):
                 rs = final["readiness_signals"]
@@ -687,7 +858,6 @@ async def analysis_sse_stream(thread_id: str, request: Request):
     """SSE stream specifically for the deep analysis pipeline events."""
     if thread_id not in active_sessions:
         raise HTTPException(status_code=404, detail="Session not found")
-    
     queue: asyncio.Queue = asyncio.Queue()
     if thread_id not in sse_subscribers:
         sse_subscribers[thread_id] = []

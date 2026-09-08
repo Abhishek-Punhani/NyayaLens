@@ -1,9 +1,7 @@
-import sqlite3
 from langgraph.graph import StateGraph, START, END
 from langgraph.types import Send
-from langgraph.checkpoint.sqlite import SqliteSaver
+from app.graphs.intake_graph import shared_checkpointer
 from app.state import CaseState
-from app.config import SQLITE_CHECKPOINT_PATH
 from app.agents.analysis_agents import (
     precedent_research_node,
     statute_analysis_node,
@@ -16,7 +14,10 @@ from app.agents.analysis_agents import (
 )
 
 
-def build_analysis_graph():
+def build_analysis_graph(checkpointer=None):
+    if checkpointer is None:
+        checkpointer = shared_checkpointer
+
     builder = StateGraph(CaseState)
 
     builder.add_node("precedent_research",   precedent_research_node)
@@ -43,8 +44,6 @@ def build_analysis_graph():
     builder.add_edge("readiness_analysis", "packet_compiler")
     builder.add_edge("packet_compiler", END)
 
-    conn = sqlite3.connect(SQLITE_CHECKPOINT_PATH, check_same_thread=False)
-    checkpointer = SqliteSaver(conn)
     return builder.compile(checkpointer=checkpointer)
 
 analysis_graph = build_analysis_graph()
