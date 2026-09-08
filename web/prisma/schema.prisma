@@ -30,6 +30,25 @@ model CaseSession {
   backendSessionId String  @unique  // The FastAPI thread_id
   status      String    @default("INTAKE")  // INTAKE | ANALYSIS | DONE
   shareLink   String    @unique  // Generated sharable link token
+  callStatus       String    @default("PENDING") // PENDING | IN_PROGRESS | COMPLETED | DISCONNECTED
+  callSummary      String?
+  callAttempts     Int       @default(0)
+  callDuration     Int       @default(0) // in seconds
+  lastCallAt       DateTime?
+  factsCount       Int       @default(0)
+  flagsCount       Int       @default(0)
+  calls            CallLog[]
   createdAt   DateTime  @default(now())
   updatedAt   DateTime  @updatedAt
+}
+
+model CallLog {
+  id          String      @id @default(cuid())
+  sessionId   String
+  session     CaseSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  status      String      // COMPLETED | DISCONNECTED
+  duration    Int         @default(0) // seconds
+  summary     String?
+  factsCount  Int         @default(0)
+  createdAt   DateTime    @default(now())
 }

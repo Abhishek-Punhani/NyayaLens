@@ -69,7 +69,7 @@ export function ControlTray({ callState, muted, volume, onMuteToggle, onConnect,
         {/* Connect / Disconnect button */}
         <div className="flex flex-col items-center gap-1">
           <button
-            onClick={isActive ? onDisconnect : onConnect}
+            onClick={isActive ? () => onDisconnect() : () => onConnect()}
             disabled={callState === 'connecting' || callState === 'ended' || apiKeyMissing}
             className={`
               w-12 h-12 rounded-[18px] flex items-center justify-center

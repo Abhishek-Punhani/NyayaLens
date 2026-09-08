@@ -68,41 +68,10 @@ install:
 	cd $(FRONTEND_DIR) && npm install
 	@echo "$(GREEN)✅ All dependencies installed.$(RESET)"
 
-## ─── seed: build ChromaDB corpus ────────────────────────────────────────────
-seed:
-	@echo "$(YELLOW)▶ Seeding ChromaDB corpus from judgments.json…$(RESET)"
-	@echo "   (Requires GOOGLE_API_KEY in $(BACKEND_DIR)/.env)"
-	cd $(BACKEND_DIR) && python -m app.legal_data.corpus_builder
-	@echo "$(GREEN)✅ ChromaDB corpus seeded.$(RESET)"
 
 ## ─── check: AST syntax check all backend Python files ───────────────────────
 check:
-	@echo "$(YELLOW)▶ Syntax-checking all backend Python files…$(RESET)"
-	@python -c "\
-import ast, pathlib, sys; \
-errors = []; \
-files = list(pathlib.Path('$(BACKEND_DIR)/app').rglob('*.py')); \
-[errors.append(f'{f}: {e}') for f in files for e in [None] if not [ast.parse(f.read_text())] or False]; \
-" 2>/dev/null; \
-python -c "\
-import ast, pathlib, sys; \
-errors = []; \
-files = sorted(pathlib.Path('$(BACKEND_DIR)/app').rglob('*.py')); \
-[errors.append(str(f) + ': ' + str(e)) for f in files \
- for _ in [None] \
- if [setattr(sys, '_x', None)] \
- and not (lambda f: (ast.parse(f.read_text()), False)[1])(f) \
-]; \
-" 2>/dev/null || true; \
-python -c "\
-import ast, pathlib, sys; \
-errors = []; \
-for f in sorted(pathlib.Path('$(BACKEND_DIR)/app').rglob('*.py')): \
-    try: ast.parse(f.read_text()) \
-    except SyntaxError as e: errors.append(f'{f}: {e}'); \
-print(f'✅ {len(list(pathlib.Path(\"$(BACKEND_DIR)/app\").rglob(\"*.py\")))} .py files syntax clean' if not errors else 'ERRORS: ' + chr(10).join(errors)); \
-sys.exit(1 if errors else 0) \
-"
+	@python3 -c "import pathlib, py_compile; files = list(pathlib.Path('$(BACKEND_DIR)/app').rglob('*.py')); [py_compile.compile(str(f), doraise=True) for f in files]; print(f'✅ {len(files)} .py files syntax clean')"
 	@echo "$(GREEN)✅ Check complete.$(RESET)"
 
 ## ─── clean: remove build artefacts ──────────────────────────────────────────

@@ -83,7 +83,7 @@ export function DeepAnalysisView({ session }: { session: Session }) {
       <div className="w-[35%] shrink-0 border-r flex flex-col" style={{ borderColor: 'rgba(255,255,255,0.07)', background: '#141719' }}>
         <div className="px-4 py-3 border-b flex items-center gap-2 bg-[#141719]/80 backdrop-blur-md" style={{ borderColor: 'rgba(255,255,255,0.07)' }}>
           <div className={`w-2 h-2 rounded-full ${streamDone ? 'bg-emerald-400' : 'bg-purple-400 animate-pulse'}`} style={{ boxShadow: streamDone ? '0 0 8px rgba(52,211,153,0.5)' : '0 0 8px rgba(192,132,252,0.5)' }} />
-          <span className="font-mono text-[#e1e2e3] text-xs font-bold">{streamDone ? 'Analysis Complete' : 'Analysis Running...'}</span>
+          <span className="font-mono text-[#e1e2e3] text-xs font-bold">{streamDone ? 'Analysis Complete' : 'Thinking...'}</span>
         </div>
         <div
           ref={scrollRef}

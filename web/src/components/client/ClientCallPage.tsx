@@ -31,6 +31,8 @@ export function ClientCallPage() {
   const [sessionError, setSessionError] = useState<string | null>(null)
   const [callState, setCallState] = useState<CallState>('idle')
   const [endReason, setEndReason] = useState<'completed' | 'disconnected' | null>(null)
+  const endReasonRef = useRef<'completed' | 'disconnected' | null>(null)
+  const callStartTime = useRef<number | null>(null)
   const [pendingDocs, setPendingDocs] = useState<PendingDoc[]>([])
   const [speakingText, setSpeakingText] = useState('')
   const [muted, setMuted] = useState(false)
@@ -66,6 +68,12 @@ export function ClientCallPage() {
         tools: NYAYA_TOOLS
       })
       setCallState('connected')
+      callStartTime.current = Date.now()
+      if (token) {
+        fetch(`/api/sessions/${token}/call-start`, { method: 'POST' }).catch(err => {
+          console.error('Failed to notify call start:', err)
+        })
+      }
       setTimeout(() => {
         try { client.send([{ text: 'Namaste. Please begin the session now.' }]) } catch {}
       }, 600)
@@ -73,13 +81,29 @@ export function ClientCallPage() {
       setCallState('idle')
       alert('Connection failed: ' + err.message)
     }
-  }, [sessionInfo, apiKey, client, connect])
+  }, [sessionInfo, apiKey, client, connect, token])
 
-  const handleDisconnect = useCallback(() => {
+  const handleDisconnect = useCallback((reasonOverride?: unknown) => {
+    const finalReason = typeof reasonOverride === 'string' && (reasonOverride === 'completed' || reasonOverride === 'disconnected')
+      ? reasonOverride
+      : (endReasonRef.current || endReason || 'disconnected')
+    const duration = callStartTime.current ? Math.round((Date.now() - callStartTime.current) / 1000) : 0
+    callStartTime.current = null
+
     disconnect()
     setCallState('ended')
-    setEndReason(prev => prev || 'disconnected')
-  }, [disconnect])
+    setEndReason(finalReason)
+
+    if (token) {
+      fetch(`/api/sessions/${token}/call-end`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ status: finalReason, duration })
+      }).catch(err => {
+        console.error('Failed to notify call end:', err)
+      })
+    }
+  }, [disconnect, endReason, token])
 
   // Wire tool calls
   useEffect(() => {
@@ -88,8 +112,9 @@ export function ClientCallPage() {
       setCallState('thinking')
       const endCall = (toolCall.functionCalls ?? []).find((f: any) => f.name === 'end_session')
       if (endCall) {
+        endReasonRef.current = 'completed'
         setEndReason('completed')
-        setTimeout(() => handleDisconnect(), 2000)
+        setTimeout(() => handleDisconnect('completed'), 2000)
         client.sendToolResponse({ functionResponses: [{ id: endCall.id, name: 'end_session', response: { output: JSON.stringify({ status: 'ending' }) } }] })
         return
       }
