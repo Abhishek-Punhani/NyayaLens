@@ -84,96 +84,17 @@ SECTION_NOTES: dict[str, str] = {
 }
 
 # ---------------------------------------------------------------------------
-# Property-dispute vertical: quick lookup for the relevant sections
+# Dynamic Statute Lookup via statute_db (civictech_db JSON dataset)
+# All statutory text and titles are retrieved dynamically from the database.
 # ---------------------------------------------------------------------------
 
-PROPERTY_DISPUTE_SECTIONS: dict[str, dict] = {
-    "SRA_6": {
-        "exact_citation": "Section 6, Specific Relief Act, 1963",
-        "summary": (
-            "Fast-track possession-only remedy. Any person dispossessed of immovable property "
-            "without consent and otherwise than by due process of law may recover possession. "
-            "LIMITATION: suit must be filed within 6 months of dispossession. "
-            "Cannot be filed against the Government. No appeal or review lies from an order "
-            "under this section. Does not bar a later full title suit."
-        ),
-        "law_version": "pre_2024_codes",   # SRA 1963 is unchanged by the 2024 criminal-law revision
-        "applicability_status": "good_law",
-    },
-    "LIMITATION_ART_65": {
-        "exact_citation": "Article 65, First Schedule, Limitation Act, 1963",
-        "summary": (
-            "Title suit track. 12-year limitation period running from the date the defendant's "
-            "possession becomes adverse to the owner's title. Requires proving better title, "
-            "not just prior possession."
-        ),
-        "law_version": "pre_2024_codes",
-        "applicability_status": "good_law",
-    },
-    "REGISTRATION_17": {
-        "exact_citation": "Section 17, Registration Act, 1908",
-        "summary": (
-            "Compulsory registration for non-testamentary instruments transferring, assigning, "
-            "limiting, or extinguishing any right/title/interest in immovable property of "
-            "value Rs. 100 or more. Unregistered instruments are inadmissible as evidence of "
-            "such transactions. State-level amendments may vary the threshold."
-        ),
-        "law_version": "pre_2024_codes",
-        "applicability_status": "good_law",
-    },
-    "BSA_63": {
-        "exact_citation": "Section 63, Bharatiya Sakshya Adhiniyam, 2023",
-        "summary": (
-            "Secondary electronic evidence (copies, printouts, screenshots) requires a "
-            "certificate signed by TWO persons: (a) the person responsible for the device "
-            "on which the record is stored, and (b) a technical expert. The certificate must "
-            "include the hash value of the electronic record. Applies to events on/after 1 Jul 2024."
-        ),
-        "law_version": "post_2024_codes",
-        "applicability_status": "good_law",
-    },
-    "IEA_65B": {
-        "exact_citation": "Section 65B, Indian Evidence Act, 1872",
-        "summary": (
-            "Electronic evidence certificate for events BEFORE 1 July 2024. Requires a person "
-            "responsible for the computer's operation to certify the record. Superseded by BSA §63 "
-            "for events on/after 1 July 2024."
-        ),
-        "law_version": "pre_2024_codes",
-        "applicability_status": "superseded",
-        "contradiction_or_limit": "Superseded by BSA §63 for post-2024 events.",
-    },
-    "BNS_318": {
-        "exact_citation": "Section 318, Bharatiya Nyaya Sanhita, 2023",
-        "summary": "Cheating and dishonestly inducing delivery of property. Replaces IPC §420.",
-        "law_version": "post_2024_codes",
-        "applicability_status": "good_law",
-    },
-    "BNS_329": {
-        "exact_citation": "Section 329, Bharatiya Nyaya Sanhita, 2023",
-        "summary": (
-            "Criminal trespass — entry onto property in another's possession with intent to "
-            "commit an offence or intimidate, insult, or annoy. Replaces IPC §441/442/447."
-        ),
-        "law_version": "post_2024_codes",
-        "applicability_status": "good_law",
-    },
-    "BNS_316": {
-        "exact_citation": "Section 316, Bharatiya Nyaya Sanhita, 2023",
-        "summary": "Criminal breach of trust. Replaces IPC §405/406.",
-        "law_version": "post_2024_codes",
-        "applicability_status": "good_law",
-    },
-    "BNSS_173": {
-        "exact_citation": "Section 173, Bharatiya Nagarik Suraksha Sanhita, 2023",
-        "summary": (
-            "FIR registration for cognizable offences. Now includes mandatory preliminary enquiry "
-            "within 14 days before registering an FIR for certain offences. Replaces CrPC §154."
-        ),
-        "law_version": "post_2024_codes",
-        "applicability_status": "good_law",
-    },
-}
+from app.legal_data.statute_db import get_section as get_statute_section, get_citation_string
+
+
+def get_section_details(act: str, section: str) -> Optional[dict]:
+    """Retrieve section metadata directly from civictech_db via statute_db."""
+    return get_statute_section(act, section)
+
 
 # ---------------------------------------------------------------------------
 # Core utility: determine applicable law from event date

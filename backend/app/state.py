@@ -1,8 +1,9 @@
 from __future__ import annotations
-from typing import TypedDict, Literal, Optional, Annotated
-from pydantic import BaseModel, Field
+from typing import TypedDict, Literal, Optional, Annotated, Union, Any
+from pydantic import BaseModel, Field, field_validator, ConfigDict
 from langgraph.graph import add_messages
 import operator
+import re
 
 EvidenceType = Literal["CLIENT_STATED", "DOCUMENT_EXTRACTED", "LEGAL_SOURCE", "INFERENCE", "UNKNOWN"]
 
@@ -90,6 +91,102 @@ class ReadinessSignals(BaseModel):
     documentary_corroboration_reason: str
     lawyer_summary: str                 # plain-language: "here's what's solid and what's open"
 
+
+EmploymentType = Literal[
+    "permanent_salaried",
+    "self_employed",
+    "daily_wager",
+    "homemaker",
+    "student",
+    "retired",
+]
+
+IncomeProofType = Literal[
+    "itr",
+    "salary_slip",
+    "bank_statement",
+    "minimum_wage_notification",
+    "none",
+]
+
+DrivingLicenseValidity = Literal[
+    "valid",
+    "expired",
+    "suspended",
+    "no_license",
+]
+
+CriminalHistory = Literal[
+    "none",
+    "pending_fir",
+    "prior_conviction",
+    "traffic_challans",
+]
+
+
+class Dependent(BaseModel):
+    name: Optional[str] = None
+    relation: Optional[str] = None
+    age: Optional[int] = None
+    financial_dependency: Optional[str] = None  # full | partial | none | dependent | independent
+
+
+class ClientProfile(BaseModel):
+    """
+    Legally required Indian MACT Client & Victim Profile.
+    Anchored to:
+    - Sarla Verma v. DTC (2009) [Multiplier table & personal living expense deductions]
+    - National Insurance v. Pranay Sethi (2017) [Future prospects & conventional heads]
+    - Raj Kumar v. Ajay Kumar (2011) [Functional disability vs earning capacity loss]
+    - Motor Vehicles Act, 1988 (§166, §168, §147-150)
+    - Bharatiya Sakshya Adhiniyam, 2023 (§149 / IEA §146)
+    """
+    model_config = ConfigDict(extra="allow")
+
+    full_name: Optional[str] = None
+    age: Optional[int] = None
+    dob: Optional[str] = None
+    education_qualification: Optional[str] = None  # e.g. 10th, 12th, Graduate, Postgraduate, Professional
+    occupation: Optional[str] = None
+    employer_name: Optional[str] = None
+    employment_type: Optional[Union[EmploymentType, str]] = None
+    monthly_income: Optional[float] = None
+    income_proof_type: Optional[Union[IncomeProofType, str]] = None
+    dependents: list[dict] = Field(default_factory=list)  # list of dict (name, relation, age, financial_dependency)
+    driving_license_number: Optional[str] = None
+    driving_license_validity: Optional[Union[DrivingLicenseValidity, str]] = None
+    criminal_history: Optional[Union[CriminalHistory, str]] = None
+    pre_existing_conditions: Optional[str] = None
+    disability_percentage: Optional[float] = None
+    functional_disability_impact: Optional[str] = None
+
+    @field_validator("age", mode="before")
+    @classmethod
+    def _coerce_age(cls, v: Any) -> Optional[int]:
+        if v is None or v == "":
+            return None
+        if isinstance(v, (int, float)):
+            return int(v)
+        if isinstance(v, str):
+            digits = "".join(ch for ch in v if ch.isdigit())
+            return int(digits) if digits else None
+        return None
+
+    @field_validator("monthly_income", "disability_percentage", mode="before")
+    @classmethod
+    def _coerce_float(cls, v: Any) -> Optional[float]:
+        if v is None or v == "":
+            return None
+        if isinstance(v, (int, float)):
+            return float(v)
+        if isinstance(v, str):
+            cleaned = v.replace(",", "").replace("₹", "").replace("Rs.", "").replace("Rs", "").replace("%", "").strip()
+            m = re.search(r"[-+]?\d*\.?\d+", cleaned)
+            if m:
+                return float(m.group(0))
+        return None
+
+
 class CaseState(TypedDict):
     thread_id: str
     language: str                        # detected language code
@@ -121,5 +218,6 @@ class CaseState(TypedDict):
         "engage", "narrative", "timeline_liability",
         "regulatory", "quantum_profiling", "defense_audit", "closure"
     ]]
-    # Victim/client profile for Sarla Verma / Pranay Sethi MACT compensation calculation
-    client_profile: Optional[dict]
+    # Comprehensive MACT Victim/client profile conforming to ClientProfile schema
+    client_profile: Optional[Union[dict, ClientProfile]]
+
