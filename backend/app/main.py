@@ -203,6 +203,8 @@ def _initial_state(
         "readiness_signals": None,
         "lawyer_packet_markdown": None,
         "lawyer_packet_json": None,
+        "intake_engine_state": None,
+        "current_question": None,
     }
 
 
@@ -524,12 +526,15 @@ async def handle_tool_call(request: ToolCallRequest, background_tasks: Backgroun
             return await _handle_trigger_analysis(session_id, args, background_tasks)
 
         elif tool_name == "initiate_confirmation":
-            from langgraph.types import Command
-            # Move graph to confirmation_flow node
-            await intake_graph.ainvoke(
-                Command(goto="confirmation_flow"),
-                config=_graph_config(session_id),
-            )
+            # Signal the graph to transition to confirmation flow on next run.
+            # The graph routes to confirmation_step1 when intake_phase=="confirmation".
+            try:
+                await intake_graph.aupdate_state(
+                    _graph_config(session_id),
+                    {"intake_phase": "confirmation"},
+                )
+            except Exception as exc:
+                logger.warning("Could not update state for confirmation: %s", exc)
             current = _get_current_state(session_id)
             lawyer_name = current.get("lawyer_name", "Vakeel Sahab") if current else "Vakeel Sahab"
             return {

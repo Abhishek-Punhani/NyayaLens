@@ -1,7 +1,11 @@
 from __future__ import annotations
 from typing import TypedDict, Literal, Optional, Annotated, Union, Any
 from pydantic import BaseModel, Field, field_validator, ConfigDict
-from langgraph.graph import add_messages
+try:
+    from langgraph.graph import add_messages
+except ImportError:
+    def add_messages(left, right):
+        return list(left or []) + list(right or [])
 import operator
 import re
 
@@ -187,6 +191,28 @@ class ClientProfile(BaseModel):
         return None
 
 
+def _merge_facts(existing: list[Fact], update: list[Fact]) -> list[Fact]:
+    if not existing:
+        return list(update or [])
+    if not update:
+        return list(existing)
+    by_id = {f.fact_id: f for f in existing}
+    for f in update:
+        by_id[f.fact_id] = f
+    return list(by_id.values())
+
+
+def _merge_flags(existing: list[FuzzinessFlag], update: list[FuzzinessFlag]) -> list[FuzzinessFlag]:
+    if not existing:
+        return list(update or [])
+    if not update:
+        return list(existing)
+    by_id = {f.flag_id: f for f in existing}
+    for f in update:
+        by_id[f.flag_id] = f
+    return list(by_id.values())
+
+
 class CaseState(TypedDict):
     thread_id: str
     language: str                        # detected language code
@@ -195,11 +221,11 @@ class CaseState(TypedDict):
     dispossession_track: Literal["section_6", "title_suit", "unclear", "not_determined"]
     intake_phase: Literal["open_narrative", "cross_question", "document_request", "confirmation", "complete", "human_handoff"]
     messages: Annotated[list, add_messages]   # full conversation history
-    facts: Annotated[list[Fact], operator.add]
+    facts: Annotated[list[Fact], _merge_facts]
     documents: list[DocumentRecord]
     entity_graph: dict                   # networkx-serializable adjacency dict
     timeline: list[dict]                 # {event, date, fact_refs, certainty}
-    fuzziness_flags: Annotated[list[FuzzinessFlag], operator.add]
+    fuzziness_flags: Annotated[list[FuzzinessFlag], _merge_flags]
     consent: ConsentRecord
     handoff_status: Literal["pending", "confirmed", "declined", "sent"]
     lawyer_name: Optional[str]
@@ -220,4 +246,8 @@ class CaseState(TypedDict):
     ]]
     # Comprehensive MACT Victim/client profile conforming to ClientProfile schema
     client_profile: Optional[Union[dict, ClientProfile]]
+    # Deterministic intake engine state (fields, people, emergency, turns, raw_notes)
+    intake_engine_state: Optional[dict]
+    # Current question scheduled for client response
+    current_question: Optional[dict]
 

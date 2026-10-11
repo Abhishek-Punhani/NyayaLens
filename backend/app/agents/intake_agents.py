@@ -7,6 +7,7 @@ every Fact produced.
 """
 from __future__ import annotations
 
+import datetime as dt
 import json
 import logging
 import uuid
@@ -19,6 +20,23 @@ from langgraph.types import interrupt
 from pydantic import BaseModel as _PydanticBase
 
 from app.config import GOOGLE_API_KEY, MODEL_FLASH
+from app.intake_engine.engine import (
+    MergeError,
+    apply_derivations,
+    current_stage,
+    derive_flags,
+    is_complete,
+    new_intake,
+    next_question,
+    process_turn,
+    project_entity_graph,
+    project_facts,
+    project_profile,
+    project_timeline,
+    register_failed_turn,
+    safety_question,
+)
+from app.intake_engine.extractor import IntakeExtractor
 from app.legal_data.Motor_accident_schema import (
     get_missing_fields_by_phase,
     get_next_priority_field,
@@ -550,6 +568,126 @@ async def document_request_node(state: CaseState) -> dict:
     except Exception as exc:
         logger.error("document_request_node error: %s", exc, exc_info=True)
         return {}
+
+
+# ---------------------------------------------------------------------------
+# Node 2b — Ask Node (deterministic, zero LLM calls before interrupt)
+# ---------------------------------------------------------------------------
+
+async def ask_node(state: CaseState) -> dict:
+    """
+    Picks the next question deterministically (no LLM) and suspends via
+    interrupt(). On resume, LangGraph routes to extract_merge_node.
+
+    Flow:
+      1. Initialise `intake_engine_state` on first call.
+      2. Emergency check (turn 0 only) — if intake marks emergency, ask safety
+         question first.
+      3. Otherwise ask `next_question()`.
+      4. If no more questions → transition to confirmation phase.
+    """
+    intake: dict = state.get("intake_engine_state") or new_intake()
+    lang: str = state.get("language") or "hi"
+    turns: int = intake.get("turns", 0)
+
+    # Emergency safety check on very first turn
+    if intake.get("emergency") and turns == 0:
+        nq = safety_question(lang)
+    else:
+        nq = next_question(intake, lang)
+
+    if nq is None:
+        # All questions answered — hand off to confirmation flow
+        return {
+            "intake_engine_state": intake,
+            "intake_phase": "confirmation",
+        }
+
+    # Pure Python: store the question, then suspend
+    msg = AIMessage(content=nq["text"])
+    answer: str = interrupt(value={
+        "spoken_response": nq["text"],
+        "key": nq["key"],
+        "stage": nq.get("stage", "engage"),
+    })
+
+    return {
+        "intake_engine_state": intake,
+        "current_question": nq,
+        "interview_stage": nq.get("stage", "engage"),
+        "messages": [msg, HumanMessage(content=answer)],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Node 2c — Extract-Merge Node (single LLM call, updates CaseState projections)
+# ---------------------------------------------------------------------------
+
+async def extract_merge_node(state: CaseState) -> dict:
+    """
+    Runs after the user responds to ask_node's interrupt.
+    1. Extracts structured facts from the raw answer via IntakeExtractor.
+    2. Merges into the deterministic engine state (transactional, quote-verified).
+    3. Projects updated engine state → CaseState fields (facts, client_profile,
+       timeline, entity_graph, fuzziness_flags).
+    4. Advances to next turn.
+    """
+    intake: dict = state.get("intake_engine_state") or new_intake()
+    asked: dict | None = state.get("current_question")
+    lang: str = state.get("language") or "hi"
+
+    # Recover the user's answer — last HumanMessage in state
+    messages = state.get("messages", [])
+    answer_text = ""
+    for msg in reversed(messages):
+        if isinstance(msg, HumanMessage):
+            answer_text = msg.content or ""
+            break
+
+    msg_id = f"msg_{uuid.uuid4().hex[:8]}"
+
+    try:
+        result = await IntakeExtractor().aextract(intake, answer_text, asked)
+    except Exception as exc:
+        logger.error("IntakeExtractor.aextract failed: %s", exc)
+        register_failed_turn(intake, asked, msg_id, answer_text, f"extractor_error:{exc}")
+        result = None
+
+    if result is not None:
+        try:
+            intake = process_turn(intake, result, msg_id, answer_text, asked)
+        except MergeError as me:
+            logger.warning("MergeError (non-fatal, turn skipped): %s", me)
+            register_failed_turn(intake, asked, msg_id, answer_text, str(me))
+
+    # Apply date-based derivations (§166(3) limitation etc.)
+    apply_derivations(intake, dt.date.today())
+
+    # Project engine state → CaseState shapes
+    projected_facts = project_facts(intake)
+    projected_profile = project_profile(intake)
+    projected_timeline = project_timeline(intake)
+    projected_eg = project_entity_graph(intake)
+    projected_flags = derive_flags(intake, state.get("fuzziness_flags", []))
+
+    # Derive law version context from accident date if available
+    law_ctx = {}
+    acc_date = (intake.get("fields", {}).get("accident_date") or {}).get("value")
+    if acc_date:
+        law_ctx["law_version_context"] = get_applicable_law(acc_date)
+
+    stage = current_stage(intake)
+
+    return {
+        "intake_engine_state": intake,
+        "facts": projected_facts,
+        "client_profile": projected_profile,
+        "timeline": projected_timeline,
+        "entity_graph": projected_eg,
+        "fuzziness_flags": projected_flags,
+        "interview_stage": stage,
+        **law_ctx,
+    }
 
 
 # ---------------------------------------------------------------------------
